@@ -1,0 +1,58 @@
+name: Build InstagramCameraControlScroll Dylib
+
+on:
+  push:
+    branches: [ main, master, dev, "**" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Unit Tests
+        run: |
+          python3 test_camera_control_scroll.py
+
+      - name: Compile InstagramCameraControlScroll.dylib
+        run: |
+          chmod +x build.sh
+          ./build.sh
+          ls -lh InstagramCameraControlScroll.dylib
+          file InstagramCameraControlScroll.dylib
+
+      - name: Release Dylib
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD_TAG="v${{ github.run_number }}"
+          COMMIT_ID=$(git rev-parse --short HEAD)
+          RELEASE_NAME="cameracontrol${COMMIT_ID}.dylib"
+          
+          # Rename for release
+          mv InstagramCameraControlScroll.dylib "$RELEASE_NAME"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git tag -f "$BUILD_TAG" HEAD
+          git push origin -f tag "$BUILD_TAG" || true
+          
+          git tag -f latest HEAD
+          git push origin -f tag latest || true
+          
+          gh release delete "$BUILD_TAG" --yes || true
+          
+          gh release create "$BUILD_TAG" "$RELEASE_NAME" \
+            --title "InstagramCameraControlScroll Build #${{ github.run_number }}" \
+            --notes "Continuous build of $RELEASE_NAME (commit ${{ github.sha }}). Direct uncompressed binary for LiveContainer, TrollStore, or Sideloading." \
+            --latest
