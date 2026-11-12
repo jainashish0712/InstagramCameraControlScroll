@@ -38,6 +38,7 @@ static const IOHIDEventType kIOHIDEventTypeForce         = 32;
 // Digitizer fields (event type 11 << 16 | field offset).
 static const IOHIDEventField kIOHIDEventFieldDigitizerX = 0x000B0000;
 static const IOHIDEventField kIOHIDEventFieldDigitizerY = 0x000B0001;
+static const IOHIDEventField kIOHIDEventFieldDigitizerEventMask = 0x000B0007;
 static const IOHIDEventField kIOHIDEventFieldDigitizerTouch = 0x000B0009;
 static const IOHIDEventField kIOHIDEventFieldDigitizerIsDisplayIntegrated = 0x000B0019;
 static const IOHIDEventField kIOHIDEventFieldScrollX = 0x00060000;
@@ -110,8 +111,9 @@ static CGFloat s_accumulatedSwipeDelta = 0.0;
 static const CGFloat kSwipeSnapThreshold = 35.0; // Point delta required to trigger reel flip
 static std::atomic<uint64_t> s_loggedHIDEventTypes{0};
 
-// Camera Control is a non-display digitizer. Keep its last position so raw
-// position reports can be converted into relative scroll deltas.
+// Candidate non-display digitizer state. iOS does not document raw Camera
+// Control swipe delivery through UIApplication; these values are diagnostic
+// candidates only until the event source is confirmed on-device.
 static BOOL s_cameraControlTouchActive = NO;
 static CGFloat s_lastCameraControlX = 0.0;
 static CGFloat s_lastCameraControlY = 0.0;
@@ -440,8 +442,14 @@ static void ProcessCameraControlDigitizer(IOHIDEventRef event) {
         ? s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerTouch)
         : (int32_t)(ReadHIDFloatField(event, kIOHIDEventFieldDigitizerTouch) != 0.0);
 
-    if (displayIntegrated) return;
+    if (displayIntegrated) {
+        CC_LOG("HID DIGITIZER ignored: display-integrated touch");
+        return;
+    }
     if (!touch) {
+        if (s_cameraControlTouchActive) {
+            CC_LOG("HID DIGITIZER candidate touch ended; clearing swipe state");
+        }
         s_cameraControlTouchActive = NO;
         s_cameraControlSwipeAxis = 0;
         s_cameraControlPageFlipTriggered.store(false);
@@ -458,7 +466,8 @@ static void ProcessCameraControlDigitizer(IOHIDEventRef event) {
         s_lastCameraControlY = y;
         s_cameraControlSwipeAxis = 0;
         s_cameraControlPageFlipTriggered.store(false);
-        CC_LOG("Non-display digitizer touch began (possible Camera Control swipe)");
+        CC_LOG("HID DIGITIZER candidate began (non-display; source unclassified) x=%.5f y=%.5f",
+               (double)x, (double)y);
         return;
     }
 
@@ -470,7 +479,8 @@ static void ProcessCameraControlDigitizer(IOHIDEventRef event) {
     if (s_cameraControlSwipeAxis == 0) {
         if (fabs(deltaX) < 0.0001 && fabs(deltaY) < 0.0001) return;
         s_cameraControlSwipeAxis = fabs(deltaX) > fabs(deltaY) ? 1 : 2;
-        CC_LOG("Camera Control digitizer movement detected on axis %ld", (long)s_cameraControlSwipeAxis);
+        CC_LOG("HID DIGITIZER candidate movement axis=%ld (source unclassified)",
+               (long)s_cameraControlSwipeAxis);
     }
 
     CGFloat delta = s_cameraControlSwipeAxis == 1 ? deltaX : deltaY;
@@ -485,6 +495,8 @@ static void ProcessCameraControlDigitizer(IOHIDEventRef event) {
         : delta * 15.0f;
     CGFloat maxDelta = [UIScreen mainScreen].bounds.size.height * 0.12f;
     scrollDelta = fmaxf(-maxDelta, fminf(scrollDelta, maxDelta));
+    CC_LOG("HID DIGITIZER candidate sample rawDelta=(%.5f,%.5f) scrollDelta=%.2f",
+           (double)deltaX, (double)deltaY, (double)scrollDelta);
     HandleDigitizerSwipeDeltaTriggered(scrollDelta);
 }
 
@@ -512,10 +524,13 @@ static void ProcessHIDEvent(IOHIDEventRef event, NSUInteger depth) {
         int32_t touch = s_IOHIDEventGetIntegerValue
             ? s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerTouch)
             : -1;
+        int32_t eventMask = s_IOHIDEventGetIntegerValue
+            ? s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerEventMask)
+            : -1;
         double x = ReadHIDFloatField(event, kIOHIDEventFieldDigitizerX);
         double y = ReadHIDFloatField(event, kIOHIDEventFieldDigitizerY);
-        CC_LOG("HID TOUCH event depth=%lu touch=%d displayIntegrated=%d x=%.5f y=%.5f children=%d",
-               (unsigned long)depth, touch, displayIntegrated, x, y, hasChildren);
+        CC_LOG("HID DIGITIZER event depth=%lu touch=%d displayIntegrated=%d eventMask=0x%x x=%.5f y=%.5f children=%d source=unclassified",
+               (unsigned long)depth, touch, displayIntegrated, (unsigned int)eventMask, x, y, hasChildren);
     } else if (eventType == kIOHIDEventTypeVendorDefined && s_IOHIDEventGetIntegerValue) {
         uint32_t usagePage = (uint32_t)s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldVendorDefinedUsagePage);
         uint32_t usage = (uint32_t)s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldVendorDefinedUsage);
@@ -571,13 +586,19 @@ static void ProcessHIDEvent(IOHIDEventRef event, NSUInteger depth) {
 }
 
 static void Hook__handleHIDEvent(id self, SEL _cmd, IOHIDEventRef event) {
-    // Preserve normal system/app handling before observing this event.
+    // Observe before forwarding: the original handler may consume or transform
+    // the event. Keep diagnostics active while scrolling is disabled; the
+    // action handlers independently enforce s_enabled.
+    if (event) {
+        IOHIDEventType eventType = s_IOHIDEventGetType ? s_IOHIDEventGetType(event) : UINT32_MAX;
+        CC_LOG("UIApplication HID hook received event=%p type=%u enabled=%d",
+               event, eventType, s_enabled.load());
+        ProcessHIDEvent(event, 0);
+    }
+
     if (orig__handleHIDEvent) {
         orig__handleHIDEvent(self, _cmd, event);
     }
-
-    if (!event || !s_enabled.load()) return;
-    ProcessHIDEvent(event, 0);
 }
 
 static void InstallHIDHook(void) {
