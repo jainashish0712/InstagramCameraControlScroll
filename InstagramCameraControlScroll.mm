@@ -381,57 +381,69 @@ static void HandleSwipeDeltaTriggered(CGFloat deltaY) {
 
 static void (*orig__handleHIDEvent)(id self, SEL _cmd, IOHIDEventRef event) = NULL;
 
+static void ProcessHIDEvent(IOHIDEventRef event, NSUInteger depth) {
+    // UIKit may deliver a compound HID event whose useful scroll or button
+    // event is nested several levels below the root event.
+    if (!event || depth > 8 || !s_IOHIDEventGetType) return;
+
+    IOHIDEventType eventType = s_IOHIDEventGetType(event);
+
+    if (eventType == kIOHIDEventTypeScroll &&
+        (s_IOHIDEventGetFloatValue || s_IOHIDEventGetIntegerValue)) {
+        // Scroll delta Y field = 0x00060001 (standard scroll delta axis).
+        double deltaY = s_IOHIDEventGetFloatValue
+            ? s_IOHIDEventGetFloatValue(event, 0x00060001)
+            : 0.0;
+        if (fabs(deltaY) <= 0.01 && s_IOHIDEventGetIntegerValue) {
+            deltaY = (double)s_IOHIDEventGetIntegerValue(event, 0x00060001);
+        }
+        if (fabs(deltaY) > 0.01) {
+            HandleSwipeDeltaTriggered((CGFloat)(deltaY * 15.0));
+        }
+    } else if (eventType == kIOHIDEventTypeKeyboard && s_IOHIDEventGetIntegerValue) {
+        uint32_t usagePage = (uint32_t)s_IOHIDEventGetIntegerValue(event, 0x00030000);
+        uint32_t usage     = (uint32_t)s_IOHIDEventGetIntegerValue(event, 0x00030001);
+        int32_t isDown     = s_IOHIDEventGetIntegerValue(event, 0x00030002);
+
+        if (isDown) {
+            if (usagePage == kHIDPage_CameraControl) {
+                if (usage == kHIDUsage_CC_Autofocus) {
+                    CC_LOG("IOHIDEvent: Camera Control Autofocus (Light-Press) detected!");
+                    HandleLightPressTriggered();
+                } else if (usage == kHIDUsage_CC_Shutter) {
+                    CC_LOG("IOHIDEvent: Camera Control Shutter (Hard Click) detected!");
+                    HandleHardClickTriggered();
+                }
+            } else if (usagePage == kHIDPage_Consumer) {
+                if (usage == kHIDUsage_Csmr_CameraAutofocus) {
+                    HandleLightPressTriggered();
+                } else if (usage == kHIDUsage_Csmr_CameraShutter) {
+                    HandleHardClickTriggered();
+                }
+            }
+        }
+    }
+
+    if (s_IOHIDEventGetChildren) {
+        CFArrayRef children = s_IOHIDEventGetChildren(event);
+        if (children) {
+            CFIndex count = CFArrayGetCount(children);
+            for (CFIndex i = 0; i < count; ++i) {
+                IOHIDEventRef child = (IOHIDEventRef)CFArrayGetValueAtIndex(children, i);
+                ProcessHIDEvent(child, depth + 1);
+            }
+        }
+    }
+}
+
 static void Hook__handleHIDEvent(id self, SEL _cmd, IOHIDEventRef event) {
-    // 1. Forward event immediately to system/app runloop
+    // Preserve normal system/app handling before observing this event.
     if (orig__handleHIDEvent) {
         orig__handleHIDEvent(self, _cmd, event);
     }
-    
-    // 2. Safely parse hardware event
-    if (!event || !s_enabled.load() || !s_IOHIDEventGetType) return;
-    
-    IOHIDEventType eventType = s_IOHIDEventGetType(event);
-    
-    // Check for Scroll / Swipe events
-    if (eventType == kIOHIDEventTypeScroll) {
-        if (s_IOHIDEventGetFloatValue) {
-            // Scroll delta Y field = 0x00060001 (standard scroll delta axis)
-            double deltaY = s_IOHIDEventGetFloatValue(event, 0x00060001);
-            if (fabs(deltaY) > 0.01) {
-                HandleSwipeDeltaTriggered((CGFloat)(deltaY * 15.0));
-            }
-        }
-    }
-    // Check for Keyboard / Button / Camera Control events
-    else if (eventType == kIOHIDEventTypeKeyboard) {
-        if (s_IOHIDEventGetIntegerValue) {
-            uint32_t usagePage = (uint32_t)s_IOHIDEventGetIntegerValue(event, 0x00030000); // KeyboardUsagePage
-            uint32_t usage     = (uint32_t)s_IOHIDEventGetIntegerValue(event, 0x00030001); // KeyboardUsage
-            int32_t isDown     = s_IOHIDEventGetIntegerValue(event, 0x00030002);          // KeyboardDown
-            
-            // Only trigger on button press down
-            if (isDown) {
-                // Camera Control Page (0x90)
-                if (usagePage == kHIDPage_CameraControl) {
-                    if (usage == kHIDUsage_CC_Autofocus) {
-                        CC_LOG("IOHIDEvent: Camera Control Autofocus (Light-Press) detected!");
-                        HandleLightPressTriggered();
-                    } else if (usage == kHIDUsage_CC_Shutter) {
-                        CC_LOG("IOHIDEvent: Camera Control Shutter (Hard Click) detected!");
-                        HandleHardClickTriggered();
-                    }
-                }
-                // Consumer Page (0x0C) fallback
-                else if (usagePage == kHIDPage_Consumer) {
-                    if (usage == kHIDUsage_Csmr_CameraAutofocus) {
-                        HandleLightPressTriggered();
-                    } else if (usage == kHIDUsage_Csmr_CameraShutter) {
-                        HandleHardClickTriggered();
-                    }
-                }
-            }
-        }
-    }
+
+    if (!event || !s_enabled.load()) return;
+    ProcessHIDEvent(event, 0);
 }
 
 static void InstallHIDHook(void) {
