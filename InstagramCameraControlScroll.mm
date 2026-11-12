@@ -40,6 +40,11 @@ static const IOHIDEventField kIOHIDEventFieldDigitizerX = 0x000B0000;
 static const IOHIDEventField kIOHIDEventFieldDigitizerY = 0x000B0001;
 static const IOHIDEventField kIOHIDEventFieldDigitizerTouch = 0x000B0009;
 static const IOHIDEventField kIOHIDEventFieldDigitizerIsDisplayIntegrated = 0x000B0019;
+static const IOHIDEventField kIOHIDEventFieldScrollX = 0x00060000;
+static const IOHIDEventField kIOHIDEventFieldScrollY = 0x00060001;
+static const IOHIDEventField kIOHIDEventFieldVendorDefinedUsagePage = 0x00010000;
+static const IOHIDEventField kIOHIDEventFieldVendorDefinedUsage = 0x00010001;
+static const IOHIDEventField kIOHIDEventFieldVendorDefinedDataLength = 0x00010003;
 
 // HID Usage Pages
 static const uint32_t kHIDPage_GenericDesktop            = 0x01;
@@ -500,17 +505,35 @@ static void ProcessHIDEvent(IOHIDEventRef event, NSUInteger depth) {
     CFArrayRef children = s_IOHIDEventGetChildren ? s_IOHIDEventGetChildren(event) : NULL;
     BOOL hasChildren = children && CFArrayGetCount(children) > 0;
 
+    if (eventType == kIOHIDEventTypeDigitizer) {
+        int32_t displayIntegrated = s_IOHIDEventGetIntegerValue
+            ? s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerIsDisplayIntegrated)
+            : -1;
+        int32_t touch = s_IOHIDEventGetIntegerValue
+            ? s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerTouch)
+            : -1;
+        double x = ReadHIDFloatField(event, kIOHIDEventFieldDigitizerX);
+        double y = ReadHIDFloatField(event, kIOHIDEventFieldDigitizerY);
+        CC_LOG("HID TOUCH event depth=%lu touch=%d displayIntegrated=%d x=%.5f y=%.5f children=%d",
+               (unsigned long)depth, touch, displayIntegrated, x, y, hasChildren);
+    } else if (eventType == kIOHIDEventTypeVendorDefined && s_IOHIDEventGetIntegerValue) {
+        uint32_t usagePage = (uint32_t)s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldVendorDefinedUsagePage);
+        uint32_t usage = (uint32_t)s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldVendorDefinedUsage);
+        uint32_t dataLength = (uint32_t)s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldVendorDefinedDataLength);
+        CC_LOG("HID VENDOR event depth=%lu page=0x%04x usage=0x%04x dataLength=%u children=%d",
+               (unsigned long)depth, usagePage, usage, dataLength, hasChildren);
+    }
+
     if (eventType == kIOHIDEventTypeDigitizer && !hasChildren) {
         ProcessCameraControlDigitizer(event);
     } else if (eventType == kIOHIDEventTypeScroll &&
         (s_IOHIDEventGetFloatValue || s_IOHIDEventGetIntegerValue)) {
-        // Scroll delta Y field = 0x00060001 (standard scroll delta axis).
-        double deltaY = s_IOHIDEventGetFloatValue
-            ? s_IOHIDEventGetFloatValue(event, 0x00060001)
-            : 0.0;
-        if (fabs(deltaY) <= 0.01 && s_IOHIDEventGetIntegerValue) {
-            deltaY = (double)s_IOHIDEventGetIntegerValue(event, 0x00060001);
-        }
+        double deltaX = ReadHIDFloatField(event, kIOHIDEventFieldScrollX);
+        double deltaY = ReadHIDFloatField(event, kIOHIDEventFieldScrollY);
+        CC_LOG("HID SCROLL event depth=%lu deltaX=%.5f deltaY=%.5f",
+               (unsigned long)depth, deltaX, deltaY);
+        // Camera Control is a one-axis surface; some firmware reports it as X.
+        if (fabs(deltaY) <= 0.01) deltaY = deltaX;
         if (fabs(deltaY) > 0.01) {
             HandleSwipeDeltaTriggered((CGFloat)(deltaY * 15.0));
         }
