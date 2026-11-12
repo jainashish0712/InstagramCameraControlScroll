@@ -35,6 +35,12 @@ static const IOHIDEventType kIOHIDEventTypeScroll        = 6;
 static const IOHIDEventType kIOHIDEventTypeDigitizer     = 11;
 static const IOHIDEventType kIOHIDEventTypeForce         = 32;
 
+// Digitizer fields (event type 11 << 16 | field offset).
+static const IOHIDEventField kIOHIDEventFieldDigitizerX = 0x000B0000;
+static const IOHIDEventField kIOHIDEventFieldDigitizerY = 0x000B0001;
+static const IOHIDEventField kIOHIDEventFieldDigitizerTouch = 0x000B0009;
+static const IOHIDEventField kIOHIDEventFieldDigitizerIsDisplayIntegrated = 0x000B0019;
+
 // HID Usage Pages
 static const uint32_t kHIDPage_GenericDesktop            = 0x01;
 static const uint32_t kHIDPage_Consumer                  = 0x0C;
@@ -97,6 +103,15 @@ static const NSTimeInterval kDoublePressWindow = 0.38; // Double-press detection
 // Capacitive Swipe Accumulator
 static CGFloat s_accumulatedSwipeDelta = 0.0;
 static const CGFloat kSwipeSnapThreshold = 35.0; // Point delta required to trigger reel flip
+static std::atomic<uint64_t> s_loggedHIDEventTypes{0};
+
+// Camera Control is a non-display digitizer. Keep its last position so raw
+// position reports can be converted into relative scroll deltas.
+static BOOL s_cameraControlTouchActive = NO;
+static CGFloat s_lastCameraControlX = 0.0;
+static CGFloat s_lastCameraControlY = 0.0;
+static NSInteger s_cameraControlSwipeAxis = 0; // 0 = undecided, 1 = X, 2 = Y
+static std::atomic<bool> s_cameraControlPageFlipTriggered{false};
 
 // ============================================================================
 // Haptic Feedback Generator
@@ -274,7 +289,7 @@ static BOOL PerformPageScroll(CCScrollDirection direction) {
     return NO;
 }
 
-static BOOL PerformContinuousDeltaScroll(CGFloat deltaY) {
+static BOOL PerformContinuousDeltaScroll(CGFloat deltaY, BOOL isDigitizerSwipe) {
     UIScrollView *sv = GetActiveScrollView();
     if (!sv) return NO;
     
@@ -289,13 +304,19 @@ static BOOL PerformContinuousDeltaScroll(CGFloat deltaY) {
     
     if (isPaging) {
         // In paging mode (Reels), accumulate swipe delta to trigger crisp page flips
+        if (isDigitizerSwipe && s_cameraControlPageFlipTriggered.load()) return YES;
         s_accumulatedSwipeDelta += deltaY;
-        if (s_accumulatedSwipeDelta >= kSwipeSnapThreshold) {
+        CGFloat snapThreshold = isDigitizerSwipe ? viewportH * 0.18f : kSwipeSnapThreshold;
+        if (s_accumulatedSwipeDelta >= snapThreshold) {
             s_accumulatedSwipeDelta = 0.0;
-            return PerformPageScroll(CCScrollDirectionNext);
-        } else if (s_accumulatedSwipeDelta <= -kSwipeSnapThreshold) {
+            BOOL didScroll = PerformPageScroll(CCScrollDirectionNext);
+            if (isDigitizerSwipe && didScroll) s_cameraControlPageFlipTriggered.store(true);
+            return didScroll;
+        } else if (s_accumulatedSwipeDelta <= -snapThreshold) {
             s_accumulatedSwipeDelta = 0.0;
-            return PerformPageScroll(CCScrollDirectionPrevious);
+            BOOL didScroll = PerformPageScroll(CCScrollDirectionPrevious);
+            if (isDigitizerSwipe && didScroll) s_cameraControlPageFlipTriggered.store(true);
+            return didScroll;
         }
         return YES;
     }
@@ -371,7 +392,17 @@ static void HandleSwipeDeltaTriggered(CGFloat deltaY) {
     CGFloat effectiveDelta = s_invertDirection.load() ? -deltaY : deltaY;
     
     dispatch_async(dispatch_get_main_queue(), ^{
-        PerformContinuousDeltaScroll(effectiveDelta);
+        PerformContinuousDeltaScroll(effectiveDelta, NO);
+    });
+}
+
+static void HandleDigitizerSwipeDeltaTriggered(CGFloat deltaY) {
+    if (!s_enabled.load()) return;
+
+    s_swipeCount.fetch_add(1);
+    CGFloat effectiveDelta = s_invertDirection.load() ? -deltaY : deltaY;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        PerformContinuousDeltaScroll(effectiveDelta, YES);
     });
 }
 
@@ -381,14 +412,97 @@ static void HandleSwipeDeltaTriggered(CGFloat deltaY) {
 
 static void (*orig__handleHIDEvent)(id self, SEL _cmd, IOHIDEventRef event) = NULL;
 
+static double ReadHIDFloatField(IOHIDEventRef event, IOHIDEventField field) {
+    if (s_IOHIDEventGetFloatValue) {
+        return s_IOHIDEventGetFloatValue(event, field);
+    }
+    if (s_IOHIDEventGetIntegerValue) {
+        return (double)s_IOHIDEventGetIntegerValue(event, field);
+    }
+    return 0.0;
+}
+
+static void ProcessCameraControlDigitizer(IOHIDEventRef event) {
+    if (!s_IOHIDEventGetIntegerValue && !s_IOHIDEventGetFloatValue) return;
+
+    // Ignore touchscreen digitizers. Camera Control is a separate, non-display
+    // touch surface; using this field also avoids turning ordinary screen drags
+    // into duplicate scroll input.
+    int32_t displayIntegrated = s_IOHIDEventGetIntegerValue
+        ? s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerIsDisplayIntegrated)
+        : 0;
+    int32_t touch = s_IOHIDEventGetIntegerValue
+        ? s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerTouch)
+        : (int32_t)(ReadHIDFloatField(event, kIOHIDEventFieldDigitizerTouch) != 0.0);
+
+    if (displayIntegrated) return;
+    if (!touch) {
+        s_cameraControlTouchActive = NO;
+        s_cameraControlSwipeAxis = 0;
+        s_cameraControlPageFlipTriggered.store(false);
+        return;
+    }
+
+    CGFloat x = (CGFloat)ReadHIDFloatField(event, kIOHIDEventFieldDigitizerX);
+    CGFloat y = (CGFloat)ReadHIDFloatField(event, kIOHIDEventFieldDigitizerY);
+    if (!std::isfinite((double)x) || !std::isfinite((double)y)) return;
+
+    if (!s_cameraControlTouchActive) {
+        s_cameraControlTouchActive = YES;
+        s_lastCameraControlX = x;
+        s_lastCameraControlY = y;
+        s_cameraControlSwipeAxis = 0;
+        s_cameraControlPageFlipTriggered.store(false);
+        CC_LOG("Non-display digitizer touch began (possible Camera Control swipe)");
+        return;
+    }
+
+    CGFloat deltaX = x - s_lastCameraControlX;
+    CGFloat deltaY = y - s_lastCameraControlY;
+    s_lastCameraControlX = x;
+    s_lastCameraControlY = y;
+
+    if (s_cameraControlSwipeAxis == 0) {
+        if (fabs(deltaX) < 0.0001 && fabs(deltaY) < 0.0001) return;
+        s_cameraControlSwipeAxis = fabs(deltaX) > fabs(deltaY) ? 1 : 2;
+        CC_LOG("Camera Control digitizer movement detected on axis %ld", (long)s_cameraControlSwipeAxis);
+    }
+
+    CGFloat delta = s_cameraControlSwipeAxis == 1 ? deltaX : deltaY;
+    if (fabs(delta) < 0.00001) return;
+
+    // HID digitizer positions may be normalized (0...1) or reported in device
+    // units. Convert either representation into screen-like scroll distance.
+    CGFloat coordinateMagnitude = fmaxf(fmaxf(fabsf(x), fabsf(y)),
+                                        fmaxf(fabsf(s_lastCameraControlX), fabsf(s_lastCameraControlY)));
+    CGFloat scrollDelta = coordinateMagnitude <= 1.5f
+        ? delta * [UIScreen mainScreen].bounds.size.height
+        : delta * 15.0f;
+    CGFloat maxDelta = [UIScreen mainScreen].bounds.size.height * 0.12f;
+    scrollDelta = fmaxf(-maxDelta, fminf(scrollDelta, maxDelta));
+    HandleDigitizerSwipeDeltaTriggered(scrollDelta);
+}
+
 static void ProcessHIDEvent(IOHIDEventRef event, NSUInteger depth) {
     // UIKit may deliver a compound HID event whose useful scroll or button
     // event is nested several levels below the root event.
     if (!event || depth > 8 || !s_IOHIDEventGetType) return;
 
     IOHIDEventType eventType = s_IOHIDEventGetType(event);
+    if (eventType < 64) {
+        uint64_t typeBit = (uint64_t)1 << eventType;
+        uint64_t loggedTypes = s_loggedHIDEventTypes.fetch_or(typeBit);
+        if ((loggedTypes & typeBit) == 0) {
+            CC_LOG("First HID event observed by app hook: type=%u", eventType);
+        }
+    }
 
-    if (eventType == kIOHIDEventTypeScroll &&
+    CFArrayRef children = s_IOHIDEventGetChildren ? s_IOHIDEventGetChildren(event) : NULL;
+    BOOL hasChildren = children && CFArrayGetCount(children) > 0;
+
+    if (eventType == kIOHIDEventTypeDigitizer && !hasChildren) {
+        ProcessCameraControlDigitizer(event);
+    } else if (eventType == kIOHIDEventTypeScroll &&
         (s_IOHIDEventGetFloatValue || s_IOHIDEventGetIntegerValue)) {
         // Scroll delta Y field = 0x00060001 (standard scroll delta axis).
         double deltaY = s_IOHIDEventGetFloatValue
@@ -424,14 +538,11 @@ static void ProcessHIDEvent(IOHIDEventRef event, NSUInteger depth) {
         }
     }
 
-    if (s_IOHIDEventGetChildren) {
-        CFArrayRef children = s_IOHIDEventGetChildren(event);
-        if (children) {
-            CFIndex count = CFArrayGetCount(children);
-            for (CFIndex i = 0; i < count; ++i) {
-                IOHIDEventRef child = (IOHIDEventRef)CFArrayGetValueAtIndex(children, i);
-                ProcessHIDEvent(child, depth + 1);
-            }
+    if (hasChildren) {
+        CFIndex count = CFArrayGetCount(children);
+        for (CFIndex i = 0; i < count; ++i) {
+            IOHIDEventRef child = (IOHIDEventRef)CFArrayGetValueAtIndex(children, i);
+            ProcessHIDEvent(child, depth + 1);
         }
     }
 }
