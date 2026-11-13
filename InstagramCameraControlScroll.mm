@@ -183,52 +183,136 @@ static UIViewController *GetTopViewController(UIViewController *root) {
     if ([root isKindOfClass:[UITabBarController class]]) {
         return GetTopViewController(((UITabBarController *)root).selectedViewController);
     }
+    // Support custom Instagram container view controllers (IGTabBarController, IGNavigationController)
+    if ([root respondsToSelector:sel_registerName("selectedViewController")]) {
+        UIViewController *selected = ((id (*)(id, SEL))objc_msgSend)(root, sel_registerName("selectedViewController"));
+        if (selected && selected != root) {
+            return GetTopViewController(selected);
+        }
+    }
+    if ([root respondsToSelector:sel_registerName("topViewController")]) {
+        UIViewController *top = ((id (*)(id, SEL))objc_msgSend)(root, sel_registerName("topViewController"));
+        if (top && top != root) {
+            return GetTopViewController(top);
+        }
+    }
+    if ([root respondsToSelector:sel_registerName("visibleViewController")]) {
+        UIViewController *vis = ((id (*)(id, SEL))objc_msgSend)(root, sel_registerName("visibleViewController"));
+        if (vis && vis != root) {
+            return GetTopViewController(vis);
+        }
+    }
     return root;
 }
 
-static UIScrollView *FindActiveScrollViewRecursive(UIView *view, CGFloat minHeight) {
-    if (!view || view.hidden || view.alpha < 0.01f) return nil;
-    
-    // If view itself is a UIScrollView and is enabled
+static void CollectVerticalScrollViewCandidates(UIView *view,
+                                                CGRect screenBounds,
+                                                CGFloat screenH,
+                                                CGFloat screenW,
+                                                UIScrollView *__strong *bestCandidate,
+                                                CGFloat *highestScore) {
+    if (!view || view.hidden || view.alpha < 0.05f) return;
+
     if ([view isKindOfClass:[UIScrollView class]]) {
         UIScrollView *sv = (UIScrollView *)view;
-        if (sv.isScrollEnabled && sv.bounds.size.height >= minHeight) {
-            // Prioritize Reels vertical pagers or primary vertical scrollviews
-            if (sv.isPagingEnabled || sv.contentSize.height > sv.bounds.size.height) {
-                CGRect windowRect = [sv convertRect:sv.bounds toView:nil];
-                CGRect screenBounds = [UIScreen mainScreen].bounds;
-                if (CGRectIntersectsRect(windowRect, screenBounds) && windowRect.size.height >= minHeight) {
-                    return sv;
+        if (sv.isScrollEnabled) {
+            CGFloat vertRange = sv.contentSize.height - sv.bounds.size.height;
+            BOOL isPagingVertical = sv.isPagingEnabled &&
+                (sv.contentSize.height > sv.contentSize.width || sv.bounds.size.height >= screenH * 0.70f);
+
+            if (vertRange > 10.0f || isPagingVertical) {
+                CGRect rectInWin = [sv convertRect:sv.bounds toView:nil];
+                CGRect visibleRect = CGRectIntersection(rectInWin, screenBounds);
+                CGFloat visArea = visibleRect.size.width * visibleRect.size.height;
+
+                if (visibleRect.size.height >= screenH * 0.35f && visibleRect.size.width >= screenW * 0.60f) {
+                    CGFloat score = visArea;
+                    if (vertRange > 0.0f) {
+                        score += fminf(vertRange, 50000.0f);
+                    }
+                    if ([sv isKindOfClass:[UICollectionView class]] || [sv isKindOfClass:[UITableView class]]) {
+                        score += 20000.0f;
+                    }
+                    const char *cName = object_getClassName(sv);
+                    if (cName && (strstr(cName, "Feed") || strstr(cName, "Main") || strstr(cName, "Home"))) {
+                        score += 50000.0f;
+                    }
+
+                    if (score > *highestScore) {
+                        *highestScore = score;
+                        *bestCandidate = sv;
+                    }
                 }
             }
         }
     }
-    
-    // Traverse subviews in reverse order (topmost subview first)
-    for (UIView *subview in [view.subviews reverseObjectEnumerator]) {
-        UIScrollView *candidate = FindActiveScrollViewRecursive(subview, minHeight);
-        if (candidate) return candidate;
+
+    for (UIView *child in view.subviews) {
+        CollectVerticalScrollViewCandidates(child, screenBounds, screenH, screenW, bestCandidate, highestScore);
     }
-    
+}
+
+static UIScrollView *FindBestVerticalScrollView(void) {
+    UIWindow *window = GetActiveKeyWindow();
+    if (!window) return nil;
+
+    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+    CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
+    CGRect screenBounds = [UIScreen mainScreen].bounds;
+
+    // 1. Center Screen Focus Check
+    // Query the exact view directly under the user's eye at the center of the screen
+    CGPoint screenCenter = CGPointMake(screenW * 0.5f, screenH * 0.5f);
+    UIView *centerView = [window hitTest:screenCenter withEvent:nil];
+
+    UIView *curr = centerView;
+    while (curr && curr != window) {
+        if ([curr isKindOfClass:[UIScrollView class]]) {
+            UIScrollView *sv = (UIScrollView *)curr;
+            if (sv.isScrollEnabled && !sv.hidden && sv.alpha > 0.05f) {
+                CGFloat vertRange = sv.contentSize.height - sv.bounds.size.height;
+                // Disqualify horizontal post carousels and story trays:
+                // Main feed vertical collection view has vertical range > 10
+                // and contentSize.height must exceed contentSize.width.
+                if (vertRange > 10.0f && sv.contentSize.height > sv.contentSize.width) {
+                    CGRect rectInWin = [sv convertRect:sv.bounds toView:nil];
+                    CGRect visibleRect = CGRectIntersection(rectInWin, screenBounds);
+                    if (visibleRect.size.height >= screenH * 0.35f) {
+                        CC_LOG("FindBestVerticalScrollView: matched center focus scrollview %p (%s), contentH=%.1f",
+                               sv, object_getClassName(sv), sv.contentSize.height);
+                        return sv;
+                    }
+                }
+            }
+        }
+        curr = curr.superview;
+    }
+
+    // 2. Comprehensive Search across window view hierarchy
+    UIScrollView *bestCandidate = nil;
+    CGFloat highestScore = -1.0f;
+    CollectVerticalScrollViewCandidates(window, screenBounds, screenH, screenW, &bestCandidate, &highestScore);
+
+    if (bestCandidate) {
+        CC_LOG("FindBestVerticalScrollView: selected candidate %p (%s), score=%.1f, contentH=%.1f",
+               bestCandidate, object_getClassName(bestCandidate), highestScore, bestCandidate.contentSize.height);
+        return bestCandidate;
+    }
+
     return nil;
 }
 
 static UIScrollView *GetActiveScrollView(void) {
+    UIScrollView *sv = FindBestVerticalScrollView();
+    if (sv) return sv;
+
     UIWindow *window = GetActiveKeyWindow();
     if (!window) return nil;
-    
     UIViewController *topVC = GetTopViewController(window.rootViewController);
-    if (!topVC) return nil;
-    
-    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
-    CGFloat minH = screenH * 0.40f; // Only pick main viewport containers
-    
-    // 1. Search top view controller's view hierarchy
-    UIScrollView *sv = FindActiveScrollViewRecursive(topVC.view, minH);
-    if (sv) return sv;
-    
-    // 2. Search entire window hierarchy if not found in topVC
-    return FindActiveScrollViewRecursive(window, minH);
+    if (topVC && [topVC.view isKindOfClass:[UIScrollView class]]) {
+        return (UIScrollView *)topVC.view;
+    }
+    return nil;
 }
 
 // ============================================================================
@@ -240,7 +324,7 @@ typedef NS_ENUM(NSInteger, CCScrollDirection) {
     CCScrollDirectionPrevious = -1
 };
 
-static BOOL PerformPageScroll(CCScrollDirection direction) {
+static BOOL PerformPageScroll(CCScrollDirection direction, NSInteger steps = 1) {
     UIScrollView *sv = GetActiveScrollView();
     if (!sv) {
         CC_LOG("PerformPageScroll: No active visible UIScrollView found in hierarchy");
@@ -248,7 +332,7 @@ static BOOL PerformPageScroll(CCScrollDirection direction) {
     }
     
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - s_lastPageScrollTime < kMinPageInterval) {
+    if (steps == 1 && (now - s_lastPageScrollTime < kMinPageInterval)) {
         return NO; // Debounce rapid consecutive triggers
     }
     s_lastPageScrollTime = now;
@@ -268,13 +352,13 @@ static BOOL PerformPageScroll(CCScrollDirection direction) {
     if (isPaging) {
         // Discrete page snap (Reels / Stories)
         if (direction == CCScrollDirectionNext) {
-            targetY = (floorf(currentOffset.y / viewportH) + 1.0f) * viewportH;
+            targetY = (floorf(currentOffset.y / viewportH) + (CGFloat)steps) * viewportH;
         } else {
-            targetY = (ceilf(currentOffset.y / viewportH) - 1.0f) * viewportH;
+            targetY = (ceilf(currentOffset.y / viewportH) - (CGFloat)steps) * viewportH;
         }
     } else {
-        // Continuous Feed / Explore page advance (75% screen height)
-        CGFloat step = viewportH * 0.75f;
+        // Continuous Feed / Explore page advance (75% screen height per step)
+        CGFloat step = viewportH * 0.75f * (CGFloat)steps;
         if (direction == CCScrollDirectionNext) {
             targetY = currentOffset.y + step;
         } else {
@@ -282,15 +366,17 @@ static BOOL PerformPageScroll(CCScrollDirection direction) {
         }
     }
     
-    // Clamp to valid content boundaries
-    CGFloat minY = -sv.contentInset.top;
-    CGFloat maxY = fmaxf(minY, sv.contentSize.height - viewportH + sv.contentInset.bottom);
+    // Clamp to valid content boundaries using adjustedContentInset
+    UIEdgeInsets insets = [sv respondsToSelector:@selector(adjustedContentInset)] ? sv.adjustedContentInset : sv.contentInset;
+    CGFloat minY = -insets.top;
+    CGFloat maxY = fmaxf(minY, sv.contentSize.height - viewportH + insets.bottom);
     targetY = fmaxf(minY, fminf(targetY, maxY));
     
     if (fabs(targetY - currentOffset.y) > 0.5f) {
         [sv setContentOffset:CGPointMake(currentOffset.x, targetY) animated:YES];
         PlayHapticFeedback(UIImpactFeedbackStyleMedium);
-        CC_LOG("Page Scroll executed: direction=%ld, isPaging=%d, targetY=%.1f", (long)direction, isPaging, targetY);
+        CC_LOG("Page Scroll executed: direction=%ld, steps=%ld, isPaging=%d, targetY=%.1f",
+               (long)direction, (long)steps, isPaging, targetY);
         return YES;
     }
     
@@ -299,7 +385,10 @@ static BOOL PerformPageScroll(CCScrollDirection direction) {
 
 static BOOL PerformContinuousDeltaScroll(CGFloat deltaY, BOOL isDigitizerSwipe) {
     UIScrollView *sv = GetActiveScrollView();
-    if (!sv) return NO;
+    if (!sv) {
+        CC_LOG("PerformContinuousDeltaScroll: No active visible vertical UIScrollView found");
+        return NO;
+    }
     
     CGFloat viewportH = sv.bounds.size.height;
     if (viewportH <= 0.0f) return NO;
@@ -334,11 +423,16 @@ static BOOL PerformContinuousDeltaScroll(CGFloat deltaY, BOOL isDigitizerSwipe) 
     CGFloat scaledDelta = deltaY * s_sensitivity.load();
     CGFloat newY = offset.y + scaledDelta;
     
-    CGFloat minY = -sv.contentInset.top;
-    CGFloat maxY = fmaxf(minY, sv.contentSize.height - viewportH + sv.contentInset.bottom);
+    UIEdgeInsets insets = [sv respondsToSelector:@selector(adjustedContentInset)] ? sv.adjustedContentInset : sv.contentInset;
+    CGFloat minY = -insets.top;
+    CGFloat maxY = fmaxf(minY, sv.contentSize.height - viewportH + insets.bottom);
     newY = fmaxf(minY, fminf(newY, maxY));
     
-    [sv setContentOffset:CGPointMake(offset.x, newY) animated:NO];
+    if (fabs(newY - offset.y) > 0.1f) {
+        [sv setContentOffset:CGPointMake(offset.x, newY) animated:NO];
+        CC_LOG("Continuous scroll: sv=%p oldY=%.1f newY=%.1f maxY=%.1f delta=%.1f",
+               sv, offset.y, newY, maxY, scaledDelta);
+    }
     return YES;
 }
 
@@ -346,10 +440,11 @@ static BOOL PerformScrollToTop(void) {
     UIScrollView *sv = GetActiveScrollView();
     if (!sv) return NO;
     
-    CGPoint topOffset = CGPointMake(sv.contentOffset.x, -sv.contentInset.top);
+    UIEdgeInsets insets = [sv respondsToSelector:@selector(adjustedContentInset)] ? sv.adjustedContentInset : sv.contentInset;
+    CGPoint topOffset = CGPointMake(sv.contentOffset.x, -insets.top);
     [sv setContentOffset:topOffset animated:YES];
     PlayHapticFeedback(UIImpactFeedbackStyleHeavy);
-    CC_LOG("Scroll to top executed");
+    CC_LOG("Scroll to top executed: sv=%p targetY=%.1f", sv, -insets.top);
     return YES;
 }
 
@@ -399,29 +494,48 @@ static void AddCameraControlScrollSlider(AVCaptureSession *session) {
     id slider = ((id (*)(id, SEL, NSString *, NSString *, float, float))objc_msgSend)(
         [sliderClass alloc],
         sel_registerName("initWithLocalizedTitle:symbolName:minValue:maxValue:"),
-        @"Scroll", @"arrow.up.and.down", 0.0f, 1.0f);
+        @"Scroll", @"arrow.up.and.down", -100.0f, 100.0f);
     if (!slider) return;
 
-    __block float previousValue = NAN;
-    __block NSTimeInterval lastSwipeTimestamp = 0.0;
+    // Center slider value at 0.0f initially
+    if ([slider respondsToSelector:@selector(setValue:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(slider, @selector(setValue:), 0.0f);
+    }
+
+    __block float previousValue = 0.0f;
+    __block BOOL isResetting = NO;
+
+    __weak id weakSlider = slider;
     void (^action)(float) = ^(float value) {
-        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-        if (std::isnan(previousValue) || (now - lastSwipeTimestamp > 0.35)) {
-            previousValue = value;
-            lastSwipeTimestamp = now;
-            return;
-        }
+        if (isResetting) return;
 
         float delta = value - previousValue;
         previousValue = value;
-        lastSwipeTimestamp = now;
+
         if (fabsf(delta) < 0.0005f) return;
 
+        // Swiping DOWN on Camera Control decreases value (delta < 0).
+        // To naturally scroll DOWN the feed (reveal lower posts),
+        // we invert the delta so negative delta becomes positive scroll offset.
         CGFloat viewportHeight = [UIScreen mainScreen].bounds.size.height;
-        CGFloat scrollDelta = (CGFloat)delta * viewportHeight;
-        CC_LOG("AVCaptureSlider swipe value=%.5f delta=%.5f scrollDelta=%.2f",
+        CGFloat scrollDelta = -(CGFloat)delta * (viewportHeight * 0.85f);
+
+        CC_LOG("AVCaptureSlider swipe: val=%.4f delta=%.4f scrollDelta=%.2f",
                value, delta, (double)scrollDelta);
         HandleSwipeDeltaTriggered(scrollDelta);
+
+        // Infinite slider re-centering:
+        // Programmatic setValue: does NOT trigger action callbacks in iOS 18 AVFoundation.
+        // Re-centering when drifting away from 0 prevents hitting boundary clamps.
+        if (fabsf(value) > 15.0f) {
+            id strongSlider = weakSlider;
+            if (strongSlider && [strongSlider respondsToSelector:@selector(setValue:)]) {
+                isResetting = YES;
+                ((void (*)(id, SEL, float))objc_msgSend)(strongSlider, @selector(setValue:), 0.0f);
+                previousValue = 0.0f;
+                isResetting = NO;
+            }
+        }
     };
     ((void (*)(id, SEL, dispatch_queue_t, id))objc_msgSend)(
         slider, sel_registerName("setActionQueue:action:"), dispatch_get_main_queue(), action);
@@ -473,11 +587,14 @@ static void HandleLightPressTriggered(void) {
         // Detect double light-press -> Page Up / Previous Reel
         if (elapsedSinceLast > 0.05 && elapsedSinceLast < kDoublePressWindow) {
             CC_LOG("Double Light-Press detected! Scrolling to previous page/reel...");
-            PerformPageScroll(s_invertDirection.load() ? CCScrollDirectionNext : CCScrollDirectionPrevious);
+            s_lastPageScrollTime = 0.0; // Reset debounce timer so double-press immediately executes
+            // Compensate for the first press that already moved 1 step forward:
+            // Move 2 steps backward so the net result is 1 step backward!
+            PerformPageScroll(s_invertDirection.load() ? CCScrollDirectionNext : CCScrollDirectionPrevious, 2);
         } else {
             // Single light-press -> Page Down / Next Reel
             CC_LOG("Single Light-Press detected! Scrolling to next page/reel...");
-            PerformPageScroll(s_invertDirection.load() ? CCScrollDirectionPrevious : CCScrollDirectionNext);
+            PerformPageScroll(s_invertDirection.load() ? CCScrollDirectionPrevious : CCScrollDirectionNext, 1);
         }
     });
 }
@@ -502,9 +619,13 @@ static void HandleSwipeDeltaTriggered(CGFloat deltaY) {
     s_swipeCount.fetch_add(1);
     CGFloat effectiveDelta = s_invertDirection.load() ? -deltaY : deltaY;
     
-    dispatch_async(dispatch_get_main_queue(), ^{
+    if ([NSThread isMainThread]) {
         PerformContinuousDeltaScroll(effectiveDelta, NO);
-    });
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            PerformContinuousDeltaScroll(effectiveDelta, NO);
+        });
+    }
 }
 
 static void HandleDigitizerSwipeDeltaTriggered(CGFloat deltaY) {
