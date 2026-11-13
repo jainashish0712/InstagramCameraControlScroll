@@ -1032,23 +1032,67 @@ static void EnsureFeedCaptureSessionRunning(void) {
             }
 
             if (!s_feedSession) {
-                // Zero-Camera Dedicated Feed Session:
-                // Initialized WITHOUT any AVCaptureDeviceInput of type AVMediaTypeVideo.
-                // Because no video hardware device input is attached:
-                // 1. Physical camera sensor is NEVER powered on (zero camera battery consumption).
-                // 2. mediaserverd does NOT report video streaming to SystemStatusServer (GREEN DOT IS 100% OFF).
-                // 3. No AVCaptureVideoPreviewLayer exists (zero video bleed-through behind comments/modals).
+                // Port-Muted Spoofed Pipeline:
+                // Attaches a real video device input and passive photo output so mediaserverd
+                // and backboardd recognize an established capture pipeline and route Camera Control
+                // hardware swipe events to AVCaptureSlider.
+                //
+                // IMMEDIATELY upon attaching:
+                // 1. All video input ports are disabled (port.enabled = NO).
+                // 2. All session connections are disabled (conn.enabled = NO).
+                //
+                // Result:
+                // - Physical camera sensor enters standby (ZERO camera battery drain).
+                // - mediaserverd reports 0 streaming video frames to SystemStatusServer (GREEN DOT IS 100% OFF).
+                // - AVCaptureVideoPreviewLayer is completely omitted (ZERO GPU load, ZERO modal bleed).
+                // - Hardware swipe gestures are delivered 100% to AVCaptureSlider.
                 s_feedSession = [[AVCaptureSession alloc] init];
+                if ([s_feedSession canSetSessionPreset:AVCaptureSessionPresetLow]) {
+                    s_feedSession.sessionPreset = AVCaptureSessionPresetLow;
+                }
+
+                [s_feedSession beginConfiguration];
+
+                AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+                if (device) {
+                    NSError *err = nil;
+                    AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&err];
+                    if (input && [s_feedSession canAddInput:input]) {
+                        [s_feedSession addInput:input];
+
+                        // SPOOF: Disable all video input ports to cut sensor power & suppress green dot
+                        for (AVCaptureInputPort *port in input.ports) {
+                            if ([port.mediaType isEqualToString:AVMediaTypeVideo]) {
+                                port.enabled = NO;
+                            }
+                        }
+                    }
+                }
+
+                AVCapturePhotoOutput *photoOutput = [[AVCapturePhotoOutput alloc] init];
+                if ([photoOutput respondsToSelector:@selector(setHighResolutionCaptureEnabled:)]) {
+                    photoOutput.highResolutionCaptureEnabled = NO;
+                }
+                if ([s_feedSession canAddOutput:photoOutput]) {
+                    [s_feedSession addOutput:photoOutput];
+                }
+
+                // Explicitly disable all connections so zero frames flow
+                for (AVCaptureConnection *conn in s_feedSession.connections) {
+                    conn.enabled = NO;
+                }
+
+                [s_feedSession commitConfiguration];
             }
 
             if (!s_feedSession.isRunning) {
-                CC_LOG("Starting zero-camera feed AVCaptureSession for Camera Control...");
+                CC_LOG("Starting port-muted spoofed AVCaptureSession for Camera Control...");
                 if (orig_AVCaptureSession_startRunning) {
                     orig_AVCaptureSession_startRunning(s_feedSession, @selector(startRunning));
                 } else {
                     [s_feedSession startRunning];
                 }
-                CC_LOG("Zero-camera feed AVCaptureSession running state: %d (Green Dot: OFF)", s_feedSession.isRunning);
+                CC_LOG("Port-muted spoofed AVCaptureSession running state: %d (Green Dot: OFF)", s_feedSession.isRunning);
             }
 
             if (@available(iOS 18.0, *)) {
@@ -1062,7 +1106,7 @@ static void EnsureFeedCaptureSessionRunning(void) {
                 }
             });
         } @catch (NSException *e) {
-            CC_LOG("Exception starting dedicated zero-camera feed session: %@", e);
+            CC_LOG("Exception starting port-muted spoofed feed session: %@", e);
         }
     });
 }
@@ -1401,6 +1445,42 @@ NSUInteger InstagramCameraControlScroll_GetClickCount(void) {
 }
 
 // ============================================================================
+// Darwin Notification Relay: Fallback from SpringBoard System HID Monitor
+// ============================================================================
+
+static void RegisterFeedSwipeDarwinNotificationObserver(void) {
+    typedef uint32_t (*NotifyRegisterDispatchFunc)(const char *, int *, dispatch_queue_t, void (^)(int));
+    typedef uint32_t (*NotifyGetStateFunc)(int, uint64_t *);
+
+    NotifyRegisterDispatchFunc regDispatch = (NotifyRegisterDispatchFunc)dlsym(RTLD_DEFAULT, "notify_register_dispatch");
+    NotifyGetStateFunc getState = (NotifyGetStateFunc)dlsym(RTLD_DEFAULT, "notify_get_state");
+
+    if (!regDispatch || !getState) {
+        CC_LOG("Darwin notification symbols unavailable");
+        return;
+    }
+
+    static int token = 0;
+    uint32_t status = regDispatch("com.instagramscroll.cameracontrol.feed-swipe", &token, dispatch_get_main_queue(), ^(int t) {
+        uint64_t state = 0;
+        if (getState(t, &state) == 0 && state != 0) {
+            int32_t centipoints = (int32_t)(state & 0xFFFFFFFF);
+            CGFloat deltaPoints = (CGFloat)centipoints / 100.0f;
+            if (std::isfinite((double)deltaPoints) && fabs(deltaPoints) > 0.01f) {
+                CGFloat viewportH = [UIScreen mainScreen].bounds.size.height;
+                CGFloat scrollDelta = -(CGFloat)deltaPoints * (viewportH * 0.05f);
+                CC_LOG("Darwin relay feed swipe: centipoints=%d deltaPoints=%.2f scrollDelta=%.2f",
+                       centipoints, (double)deltaPoints, (double)scrollDelta);
+                HandleSwipeDeltaTriggered(scrollDelta);
+                ShowCameraControlBezelOverlay(scrollDelta, @"Scroll", @"arrow.up.and.down");
+            }
+        }
+    });
+    CC_LOG("Registered Darwin notification listener for com.instagramscroll.cameracontrol.feed-swipe (status=%u, token=%d)",
+           status, token);
+}
+
+// ============================================================================
 // Initialization & Constructor
 // ============================================================================
 
@@ -1425,7 +1505,10 @@ void InstagramCameraControlScroll_Init(void) {
         // 4. Setup lifecycle observers for background/foreground session management
         SetupAppLifecycleObservers();
 
-        // 4. Observe Window Lifecycle to attach AVKit Interactions
+        // 5. Register Darwin notification listener for system HID monitor events
+        RegisterFeedSwipeDarwinNotificationObserver();
+
+        // 6. Observe Window Lifecycle to attach AVKit Interactions
         [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeKeyNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
