@@ -456,6 +456,58 @@ static BOOL PerformScrollToTop(void) {
 
 static void HandleSwipeDeltaTriggered(CGFloat deltaY);
 
+static char kCCScrollSliderAssociationKey;
+static char kCCControlsDelegateAssociationKey;
+
+static __strong NSTimer *s_sliderKeepAliveTimer = nil;
+static NSTimeInterval s_lastSliderTouchTime = 0.0;
+static __weak id s_activeCaptureSlider = nil;
+static BOOL s_sliderKeepAliveFlip = NO;
+
+static void StopSliderKeepAlive(void) {
+    if (s_sliderKeepAliveTimer) {
+        [s_sliderKeepAliveTimer invalidate];
+        s_sliderKeepAliveTimer = nil;
+    }
+}
+
+static void RefreshSliderKeepAlive(id slider) {
+    if (!slider) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        s_activeCaptureSlider = slider;
+        s_lastSliderTouchTime = [NSDate timeIntervalSinceReferenceDate];
+
+        if (s_sliderKeepAliveTimer) return;
+
+        s_sliderKeepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.8
+                                                                 repeats:YES
+                                                                   block:^(NSTimer *timer) {
+            NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+            if (now - s_lastSliderTouchTime >= 10.0) {
+                // 10 seconds expired: stop heartbeat so SpringBoard naturally dismisses the native slider overlay
+                [timer invalidate];
+                s_sliderKeepAliveTimer = nil;
+                return;
+            }
+
+            id strongSlider = s_activeCaptureSlider;
+            if (!strongSlider || ![strongSlider respondsToSelector:@selector(value)] || ![strongSlider respondsToSelector:@selector(setValue:)]) {
+                [timer invalidate];
+                s_sliderKeepAliveTimer = nil;
+                return;
+            }
+
+            // Pulse an unnoticeable micro-offset (0.0005f) to send an active property update to SpringBoard,
+            // resetting the system's 1.5s idle dismissal timer and holding the native bezel slider on screen for 10 seconds.
+            float currentVal = ((float (*)(id, SEL))objc_msgSend)(strongSlider, @selector(value));
+            s_sliderKeepAliveFlip = !s_sliderKeepAliveFlip;
+            float pulseVal = s_sliderKeepAliveFlip ? (currentVal + 0.0005f) : (currentVal - 0.0005f);
+
+            ((void (*)(id, SEL, float))objc_msgSend)(strongSlider, @selector(setValue:), pulseVal);
+        }];
+    });
+}
+
 API_AVAILABLE(ios(18.0))
 @interface CCSessionControlsDelegate : NSObject <AVCaptureSessionControlsDelegate>
 @end
@@ -463,15 +515,24 @@ API_AVAILABLE(ios(18.0))
 @implementation CCSessionControlsDelegate
 - (void)sessionControlsDidBecomeActive:(AVCaptureSession *)session {
     CC_LOG("AVCaptureSession Camera Control became active: %p", session);
+    id slider = objc_getAssociatedObject(session, &kCCScrollSliderAssociationKey);
+    if (slider) {
+        RefreshSliderKeepAlive(slider);
+    }
 }
 - (void)sessionControlsWillEnterFullscreenAppearance:(AVCaptureSession *)session {
     CC_LOG("AVCaptureSession Camera Control entering fullscreen appearance: %p", session);
+    id slider = objc_getAssociatedObject(session, &kCCScrollSliderAssociationKey);
+    if (slider) {
+        RefreshSliderKeepAlive(slider);
+    }
 }
 - (void)sessionControlsWillExitFullscreenAppearance:(AVCaptureSession *)session {
     CC_LOG("AVCaptureSession Camera Control leaving fullscreen appearance: %p", session);
 }
 - (void)sessionControlsDidBecomeInactive:(AVCaptureSession *)session {
     CC_LOG("AVCaptureSession Camera Control became inactive: %p", session);
+    StopSliderKeepAlive();
 }
 @end
 
@@ -605,9 +666,6 @@ static void ShowCameraControlBezelOverlay(CGFloat delta, NSString *title, NSStri
     });
 }
 
-static char kCCScrollSliderAssociationKey;
-static char kCCControlsDelegateAssociationKey;
-
 static void AddCameraControlScrollSlider(AVCaptureSession *session) {
     if (@available(iOS 18.0, *)) {
         if (!session || ![session respondsToSelector:@selector(supportsControls)]) return;
@@ -640,6 +698,8 @@ static void AddCameraControlScrollSlider(AVCaptureSession *session) {
 
         __weak id weakSlider = slider;
         void (^action)(float) = ^(float value) {
+            RefreshSliderKeepAlive(weakSlider);
+
             if (isResetting) return;
 
             float delta = value - previousValue;
@@ -1285,6 +1345,7 @@ static void SetupAppLifecycleObservers(void) {
                 usingBlock:^(NSNotification *note) {
         CC_LOG("App entered background; stopping capture sessions to preserve battery");
         s_isInBackground.store(true);
+        StopSliderKeepAlive();
         if (s_bezelDismissTimer) {
             [s_bezelDismissTimer invalidate];
             s_bezelDismissTimer = nil;
