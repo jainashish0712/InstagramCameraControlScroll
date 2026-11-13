@@ -941,9 +941,56 @@ static void EnsureFeedCaptureSessionRunning(void) {
             if (!s_feedSession) {
                 s_feedSession = [[AVCaptureSession alloc] init];
 
+                // Battery Optimization 1: Ultra-Low Resolution Preset (352x288 instead of 1080p/4K)
+                // Slashes pixel processing load on ISP, memory bus, and GPU by ~95%
+                if ([s_feedSession canSetSessionPreset:AVCaptureSessionPresetLow]) {
+                    s_feedSession.sessionPreset = AVCaptureSessionPresetLow;
+                }
+
                 // 1. Add back camera device input
                 AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
                 if (device) {
+                    // Battery Optimization 2: Sensor Throttling & Voice-Coil Motor Lock
+                    // Park focus and exposure motors to cut physical coil current to zero,
+                    // and drop sensor readout to the lowest supported hardware frame rate.
+                    NSError *lockError = nil;
+                    if ([device lockForConfiguration:&lockError]) {
+                        if ([device isFocusModeSupported:AVCaptureFocusModeLocked]) {
+                            device.focusMode = AVCaptureFocusModeLocked;
+                        }
+                        if ([device isExposureModeSupported:AVCaptureExposureModeLocked]) {
+                            device.exposureMode = AVCaptureExposureModeLocked;
+                        }
+                        if ([device isWhiteBalanceModeSupported:AVCaptureWhiteBalanceModeLocked]) {
+                            device.whiteBalanceMode = AVCaptureWhiteBalanceModeLocked;
+                        }
+                        if ([device respondsToSelector:@selector(isSmoothAutoFocusSupported)] && device.isSmoothAutoFocusSupported) {
+                            device.smoothAutoFocusEnabled = NO;
+                        }
+                        if ([device respondsToSelector:@selector(automaticallyAdjustsVideoHDREnabled)]) {
+                            device.automaticallyAdjustsVideoHDREnabled = NO;
+                        }
+
+                        // Configure lowest supported frame rate (e.g. 2-5 FPS instead of 30-60 FPS)
+                        AVCaptureDeviceFormat *format = device.activeFormat;
+                        if (format && format.videoSupportedFrameRateRanges.count > 0) {
+                            AVFrameRateRange *bestRange = nil;
+                            for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges) {
+                                if (!bestRange || range.minFrameRate < bestRange.minFrameRate) {
+                                    bestRange = range;
+                                }
+                            }
+                            if (bestRange && bestRange.maxFrameDuration.timescale > 0) {
+                                device.activeVideoMinFrameDuration = bestRange.maxFrameDuration;
+                                device.activeVideoMaxFrameDuration = bestRange.maxFrameDuration;
+                                CC_LOG("Configured low-power camera frame rate: %.1f FPS", (double)bestRange.minFrameRate);
+                            }
+                        }
+                        [device unlockForConfiguration];
+                    } else {
+                        CC_LOG("Could not lock camera for low-power configuration: %@", lockError);
+                    }
+
                     NSError *error = nil;
                     AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
                     if (input && [s_feedSession canAddInput:input]) {
@@ -953,6 +1000,9 @@ static void EnsureFeedCaptureSessionRunning(void) {
 
                 // 2. Add photo output to establish active capture pipeline connection
                 AVCapturePhotoOutput *photoOutput = [[AVCapturePhotoOutput alloc] init];
+                if ([photoOutput respondsToSelector:@selector(setHighResolutionCaptureEnabled:)]) {
+                    photoOutput.highResolutionCaptureEnabled = NO;
+                }
                 if ([s_feedSession canAddOutput:photoOutput]) {
                     [s_feedSession addOutput:photoOutput];
                 }
