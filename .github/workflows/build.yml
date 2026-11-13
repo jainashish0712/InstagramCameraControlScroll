@@ -31,12 +31,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BUILD_TAG="v${{ github.run_number }}"
-          COMMIT_ID=$(git rev-parse --short HEAD)
-          RELEASE_NAME="cameracontrol${COMMIT_ID}.dylib"
-          
-          # Rename for release
-          mv InstagramCameraControlScroll.dylib "$RELEASE_NAME"
-          
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
@@ -48,7 +42,8 @@ jobs:
           
           gh release delete "$BUILD_TAG" --yes || true
           
-          gh release create "$BUILD_TAG" "$RELEASE_NAME" \
+          gh release create "$BUILD_TAG" InstagramCameraControlScroll.dylib CameraControlSystemProbe.dylib \
+            InstagramCameraControlScroll.plist CameraControlSystemProbe.plist \
             --title "InstagramCameraControlScroll Build #${{ github.run_number }}" \
-            --notes "Continuous build of $RELEASE_NAME (commit ${{ github.sha }}). Direct uncompressed binary for LiveContainer, TrollStore, or Sideloading." \
+            --notes "Build of InstagramCameraControlScroll and the temporary SpringBoard HID probe (commit ${{ github.sha }}). Install each dylib with its same-named filter plist; the probe is observational." \
             --latest

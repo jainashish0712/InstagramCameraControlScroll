@@ -728,139 +728,14 @@ static void InstallHIDHook(void) {
 }
 
 static void (*orig_AVCaptureSession_startRunning)(AVCaptureSession *session, SEL selector) = NULL;
-static void (*orig_AVCaptureSession_stopRunning)(AVCaptureSession *session, SEL selector) = NULL;
-
-static __strong AVCaptureSession *s_persistedSession = nil;
-static __strong AVCaptureSession *s_feedSession = nil;
-static std::atomic<bool> s_isInBackground{false};
-static dispatch_queue_t s_feedSessionQueue = NULL;
-
-static void EnsureFeedCaptureSessionRunning(void) {
-    if (!s_enabled.load()) return;
-    if (s_isInBackground.load()) return;
-    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
-
-    // If Instagram's session is already persisted and running, keep using it
-    if (s_persistedSession && s_persistedSession.isRunning) return;
-    if (s_feedSession && s_feedSession.isRunning) return;
-
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        s_feedSessionQueue = dispatch_queue_create("com.instagram.cameracontrol.session", DISPATCH_QUEUE_SERIAL);
-    });
-
-    dispatch_async(s_feedSessionQueue, ^{
-        @try {
-            if (s_persistedSession && s_persistedSession.isRunning) return;
-            if (s_feedSession && s_feedSession.isRunning) return;
-
-            if (!s_feedSession) {
-                s_feedSession = [[AVCaptureSession alloc] init];
-                if ([s_feedSession canSetSessionPreset:AVCaptureSessionPresetLow]) {
-                    s_feedSession.sessionPreset = AVCaptureSessionPresetLow;
-                }
-
-                AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-                if (device) {
-                    NSError *error = nil;
-                    AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
-                    if (input && [s_feedSession canAddInput:input]) {
-                        [s_feedSession addInput:input];
-                    }
-                }
-            }
-
-            if (@available(iOS 18.0, *)) {
-                AddCameraControlScrollSlider(s_feedSession);
-            }
-
-            if (!s_feedSession.isRunning) {
-                CC_LOG("Starting dedicated feed AVCaptureSession for Camera Control...");
-                if (orig_AVCaptureSession_startRunning) {
-                    orig_AVCaptureSession_startRunning(s_feedSession, @selector(startRunning));
-                } else {
-                    [s_feedSession startRunning];
-                }
-                CC_LOG("Dedicated feed AVCaptureSession running state: %d", s_feedSession.isRunning);
-            }
-        } @catch (NSException *e) {
-            CC_LOG("Exception starting dedicated feed session: %@", e);
-        }
-    });
-}
 
 static void Hook_AVCaptureSession_startRunning(AVCaptureSession *session, SEL selector) {
-    // If our dedicated feed session is running and Instagram is starting its own camera session,
-    // stop our feed session so there is zero camera hardware conflict.
-    if (s_feedSession && s_feedSession != session && s_feedSession.isRunning) {
-        CC_LOG("Instagram camera session starting; yielding dedicated feed session %p", s_feedSession);
-        if (orig_AVCaptureSession_stopRunning) {
-            orig_AVCaptureSession_stopRunning(s_feedSession, @selector(stopRunning));
-        } else {
-            [s_feedSession stopRunning];
-        }
-    }
-
-    s_persistedSession = session;
-
     if (orig_AVCaptureSession_startRunning) {
         orig_AVCaptureSession_startRunning(session, selector);
     }
     if (@available(iOS 18.0, *)) {
         AddCameraControlScrollSlider(session);
     }
-}
-
-static void Hook_AVCaptureSession_stopRunning(AVCaptureSession *session, SEL selector) {
-    CC_LOG("AVCaptureSession -stopRunning called: session=%p, appState=%ld, inBackground=%d",
-           session, (long)[UIApplication sharedApplication].applicationState, s_isInBackground.load());
-
-    // When app is in background or transitioning to background, allow stopRunning so camera hardware powers down cleanly
-    if (s_isInBackground.load() || [UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
-        if (orig_AVCaptureSession_stopRunning) {
-            orig_AVCaptureSession_stopRunning(session, selector);
-        }
-        return;
-    }
-
-    // In foreground: Keep the session alive and retained so Camera Control remains active in the Feed section!
-    s_persistedSession = session;
-    CC_LOG("AVCaptureSession -stopRunning suppressed in foreground to maintain Camera Control in Feed: session=%p", session);
-}
-
-static void SetupAppLifecycleObservers(void) {
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-
-    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
-                    object:nil
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *note) {
-        CC_LOG("App entered background; stopping capture sessions to preserve battery");
-        s_isInBackground.store(true);
-        if (s_persistedSession && s_persistedSession.isRunning) {
-            if (orig_AVCaptureSession_stopRunning) {
-                orig_AVCaptureSession_stopRunning(s_persistedSession, @selector(stopRunning));
-            } else {
-                [s_persistedSession stopRunning];
-            }
-        }
-        if (s_feedSession && s_feedSession.isRunning) {
-            if (orig_AVCaptureSession_stopRunning) {
-                orig_AVCaptureSession_stopRunning(s_feedSession, @selector(stopRunning));
-            } else {
-                [s_feedSession stopRunning];
-            }
-        }
-    }];
-
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification
-                    object:nil
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *note) {
-        CC_LOG("App became active; ensuring Camera Control session is active in Feed");
-        s_isInBackground.store(false);
-        EnsureFeedCaptureSessionRunning();
-    }];
 }
 
 static void InstallCaptureSessionHook(void) {
@@ -885,17 +760,6 @@ static void InstallCaptureSessionHook(void) {
         }
     }
 
-    // 2. Hook -[AVCaptureSession stopRunning]
-    SEL stopSel = @selector(stopRunning);
-    Method stopMethod = class_getInstanceMethod(sessionClass, stopSel);
-    if (stopMethod) {
-        IMP currentStop = method_getImplementation(stopMethod);
-        if (currentStop != (IMP)Hook_AVCaptureSession_stopRunning) {
-            orig_AVCaptureSession_stopRunning = (void (*)(AVCaptureSession *, SEL))currentStop;
-            method_setImplementation(stopMethod, (IMP)Hook_AVCaptureSession_stopRunning);
-            CC_LOG("Hooked AVCaptureSession -stopRunning for Feed persistence");
-        }
-    }
 }
 
 // ============================================================================
@@ -1074,11 +938,8 @@ void InstagramCameraControlScroll_Init(void) {
         // 1. Install Low-Level HID Hook on UIApplication
         InstallHIDHook();
 
-        // 2. Register a documented swipe-value control on active camera sessions and manage session persistence.
+        // 2. Register a documented swipe-value control only on Instagram's own camera sessions.
         InstallCaptureSessionHook();
-        
-        // 3. Setup lifecycle observers for background/foreground session management
-        SetupAppLifecycleObservers();
 
         // 4. Observe Window Lifecycle to attach AVKit Interactions
         [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeKeyNotification
@@ -1101,13 +962,12 @@ void InstagramCameraControlScroll_Init(void) {
             }
         }];
         
-        // Attach immediately if key window is already present and spin up feed capture session
+        // Attach immediately if key window is already present.
         dispatch_async(dispatch_get_main_queue(), ^{
             UIWindow *win = GetActiveKeyWindow();
             if (win) {
                 AttachCaptureEventInteractionToWindow(win);
             }
-            EnsureFeedCaptureSessionRunning();
         });
         
         CC_LOG("InstagramCameraControlScroll initialized successfully!");
