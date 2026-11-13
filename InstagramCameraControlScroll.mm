@@ -730,7 +730,7 @@ static __strong AVCaptureVideoPreviewLayer *s_feedPreviewLayer = nil;
 static std::atomic<bool> s_isInBackground{false};
 static dispatch_queue_t s_feedSessionQueue = NULL;
 
-static void AttachCaptureEventInteractionToWindow(UIWindow *window);
+static void AttachCaptureEventInteractionToView(UIView *view);
 
 static void EnsurePreviewLayerAttached(AVCaptureSession *session) {
     if (!session) return;
@@ -738,31 +738,37 @@ static void EnsurePreviewLayerAttached(AVCaptureSession *session) {
         UIWindow *window = GetActiveKeyWindow();
         if (!window) return;
 
+        UIViewController *topVC = GetTopViewController(window.rootViewController);
+        UIView *targetView = (topVC && topVC.view && !topVC.view.hidden) ? topVC.view : window;
+
         if (!s_feedPreviewView) {
             s_feedPreviewView = [[UIView alloc] initWithFrame:window.bounds];
             s_feedPreviewView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
             s_feedPreviewView.userInteractionEnabled = NO;
-            s_feedPreviewView.alpha = 0.01f;
+            s_feedPreviewView.alpha = 1.0f; // Full opacity so CoreAnimation render tree treats it as active
             s_feedPreviewView.accessibilityElementsHidden = YES;
         }
 
         if (!s_feedPreviewLayer) {
             s_feedPreviewLayer = [AVCaptureVideoPreviewLayer layerWithSession:session];
             s_feedPreviewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-            s_feedPreviewLayer.frame = window.bounds;
+            s_feedPreviewLayer.frame = targetView.bounds;
             [s_feedPreviewView.layer addSublayer:s_feedPreviewLayer];
         } else if (s_feedPreviewLayer.session != session) {
             s_feedPreviewLayer.session = session;
         }
 
-        if (s_feedPreviewView.superview != window) {
-            [window insertSubview:s_feedPreviewView atIndex:0];
+        if (s_feedPreviewView.superview != targetView) {
+            [targetView insertSubview:s_feedPreviewView atIndex:0];
         }
-        s_feedPreviewView.frame = window.bounds;
-        s_feedPreviewLayer.frame = window.bounds;
+        s_feedPreviewView.frame = targetView.bounds;
+        s_feedPreviewLayer.frame = targetView.bounds;
 
-        AttachCaptureEventInteractionToWindow(window);
-        CC_LOG("AVCaptureVideoPreviewLayer verified in window hierarchy for session %p", session);
+        AttachCaptureEventInteractionToView(targetView);
+        if (window != targetView) {
+            AttachCaptureEventInteractionToView(window);
+        }
+        CC_LOG("AVCaptureVideoPreviewLayer anchored in target view %p for session %p", targetView, session);
     });
 }
 
@@ -799,7 +805,8 @@ static void EnsureFeedCaptureSessionRunning(void) {
 
             if (!s_feedSession) {
                 s_feedSession = [[AVCaptureSession alloc] init];
-                // Retain standard High/Photo session preset required for iOS 18 Camera Control hardware
+                
+                // 1. Add back camera device input
                 AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
                 if (device) {
                     NSError *error = nil;
@@ -808,10 +815,12 @@ static void EnsureFeedCaptureSessionRunning(void) {
                         [s_feedSession addInput:input];
                     }
                 }
-            }
 
-            if (@available(iOS 18.0, *)) {
-                AddCameraControlScrollSlider(s_feedSession);
+                // 2. Add photo output to establish active capture pipeline connection
+                AVCapturePhotoOutput *photoOutput = [[AVCapturePhotoOutput alloc] init];
+                if ([s_feedSession canAddOutput:photoOutput]) {
+                    [s_feedSession addOutput:photoOutput];
+                }
             }
 
             if (!s_feedSession.isRunning) {
@@ -822,6 +831,10 @@ static void EnsureFeedCaptureSessionRunning(void) {
                     [s_feedSession startRunning];
                 }
                 CC_LOG("Dedicated feed AVCaptureSession running state: %d", s_feedSession.isRunning);
+            }
+
+            if (@available(iOS 18.0, *)) {
+                AddCameraControlScrollSlider(s_feedSession);
             }
 
             EnsurePreviewLayerAttached(s_feedSession);
@@ -947,14 +960,14 @@ static void InstallCaptureSessionHook(void) {
 // AVKit AVCaptureEventInteraction Setup (iOS 17.2+ / iOS 18+)
 // ============================================================================
 
-static void AttachCaptureEventInteractionToWindow(UIWindow *window) {
-    if (!window) return;
+static void AttachCaptureEventInteractionToView(UIView *view) {
+    if (!view) return;
     
     Class interactionClass = NSClassFromString(@"AVCaptureEventInteraction");
     if (!interactionClass) return;
     
     // Check if interaction already attached
-    for (id<UIInteraction> interaction in window.interactions) {
+    for (id<UIInteraction> interaction in view.interactions) {
         if ([interaction isKindOfClass:interactionClass]) {
             return;
         }
@@ -987,8 +1000,8 @@ static void AttachCaptureEventInteractionToWindow(UIWindow *window) {
             
             interaction = ((id (*)(id, SEL, id, id))objc_msgSend)(interaction, primarySel, primaryHandler, secondaryHandler);
             if (interaction) {
-                [window addInteraction:interaction];
-                CC_LOG("Attached dual-handler AVCaptureEventInteraction to window: %p", window);
+                [view addInteraction:interaction];
+                CC_LOG("Attached dual-handler AVCaptureEventInteraction to view: %p", view);
                 return;
             }
         }
@@ -1008,12 +1021,50 @@ static void AttachCaptureEventInteractionToWindow(UIWindow *window) {
             };
             interaction = ((id (*)(id, SEL, id))objc_msgSend)(interaction, singleSel, handler);
             if (interaction) {
-                [window addInteraction:interaction];
-                CC_LOG("Attached single-handler AVCaptureEventInteraction to window: %p", window);
+                [view addInteraction:interaction];
+                CC_LOG("Attached single-handler AVCaptureEventInteraction to view: %p", view);
             }
         }
     } @catch (NSException *e) {
         CC_LOG("Exception attaching AVCaptureEventInteraction: %@", e);
+    }
+}
+
+static void AttachCaptureEventInteractionToWindow(UIWindow *window) {
+    AttachCaptureEventInteractionToView(window);
+}
+
+// ============================================================================
+// UIViewController Swizzle: Active UI Responder Chain Registration
+// ============================================================================
+
+static void (*orig_UIViewController_viewDidAppear)(UIViewController *self, SEL _cmd, BOOL animated) = NULL;
+
+static void Hook_UIViewController_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
+    if (orig_UIViewController_viewDidAppear) {
+        orig_UIViewController_viewDidAppear(self, _cmd, animated);
+    }
+    
+    if (self.view && !self.view.hidden) {
+        AttachCaptureEventInteractionToView(self.view);
+        
+        AVCaptureSession *activeSession = (s_persistedSession && s_persistedSession.isRunning)
+            ? s_persistedSession
+            : s_feedSession;
+        if (activeSession && activeSession.isRunning) {
+            EnsurePreviewLayerAttached(activeSession);
+        }
+    }
+}
+
+static void InstallViewControllerHook(void) {
+    Class vcClass = [UIViewController class];
+    SEL sel = @selector(viewDidAppear:);
+    Method m = class_getInstanceMethod(vcClass, sel);
+    if (m) {
+        orig_UIViewController_viewDidAppear = (void (*)(UIViewController *, SEL, BOOL))method_getImplementation(m);
+        method_setImplementation(m, (IMP)Hook_UIViewController_viewDidAppear);
+        CC_LOG("Hooked -[UIViewController viewDidAppear:] for active responder chain integration");
     }
 }
 
@@ -1121,8 +1172,11 @@ void InstagramCameraControlScroll_Init(void) {
 
         // 2. Register a documented swipe-value control on active camera sessions and manage session persistence.
         InstallCaptureSessionHook();
+
+        // 3. Hook viewDidAppear to integrate active UI responder chain with Camera Control
+        InstallViewControllerHook();
         
-        // 3. Setup lifecycle observers for background/foreground session management
+        // 4. Setup lifecycle observers for background/foreground session management
         SetupAppLifecycleObservers();
 
         // 4. Observe Window Lifecycle to attach AVKit Interactions
