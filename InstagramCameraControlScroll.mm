@@ -474,6 +474,135 @@ API_AVAILABLE(ios(18.0))
 }
 @end
 
+// ============================================================================
+// Native-Fidelity Bezel Pill Overlay (Zero-Camera Visual Feedback)
+// ============================================================================
+
+static __strong UIWindow *s_bezelOverlayWindow = nil;
+static __strong UIView *s_bezelPillContainer = nil;
+static __strong UIImageView *s_bezelIconView = nil;
+static __strong UILabel *s_bezelTitleLabel = nil;
+static __strong NSTimer *s_bezelDismissTimer = nil;
+static BOOL s_bezelPillVisible = NO;
+
+static void EnsureBezelOverlayViewCreated(void) {
+    if (s_bezelOverlayWindow && s_bezelPillContainer) return;
+
+    UIWindowScene *activeScene = nil;
+    UIApplication *app = [UIApplication sharedApplication];
+    for (UIScene *scene in app.connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive &&
+            [scene isKindOfClass:[UIWindowScene class]]) {
+            activeScene = (UIWindowScene *)scene;
+            break;
+        }
+    }
+
+    CGRect screenBounds = [UIScreen mainScreen].bounds;
+    if (activeScene) {
+        s_bezelOverlayWindow = [[UIWindow alloc] initWithWindowScene:activeScene];
+    } else {
+        s_bezelOverlayWindow = [[UIWindow alloc] initWithFrame:screenBounds];
+    }
+
+    s_bezelOverlayWindow.windowLevel = UIWindowLevelStatusBar - 1.0;
+    s_bezelOverlayWindow.backgroundColor = [UIColor clearColor];
+    s_bezelOverlayWindow.userInteractionEnabled = NO;
+    s_bezelOverlayWindow.hidden = NO;
+
+    // Camera Control button geometry on iPhone 16 / 16 Pro (Right Bezel, ~33% down)
+    CGFloat pillWidth = 92.0f;
+    CGFloat pillHeight = 34.0f;
+    CGFloat pillX = screenBounds.size.width - pillWidth - 6.0f;
+    CGFloat pillY = (screenBounds.size.height * 0.33f) - (pillHeight / 2.0f);
+
+    s_bezelPillContainer = [[UIView alloc] initWithFrame:CGRectMake(pillX, pillY, pillWidth, pillHeight)];
+    s_bezelPillContainer.userInteractionEnabled = NO;
+    s_bezelPillContainer.layer.cornerRadius = 17.0f;
+    s_bezelPillContainer.layer.masksToBounds = YES;
+    s_bezelPillContainer.layer.borderColor = [UIColor colorWithWhite:1.0f alpha:0.22f].CGColor;
+    s_bezelPillContainer.layer.borderWidth = 0.5f;
+    s_bezelPillContainer.alpha = 0.0f;
+
+    UIBlurEffect *blurEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark];
+    UIVisualEffectView *blurView = [[UIVisualEffectView alloc] initWithEffect:blurEffect];
+    blurView.frame = s_bezelPillContainer.bounds;
+    blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    blurView.userInteractionEnabled = NO;
+    [s_bezelPillContainer addSubview:blurView];
+
+    // Icon (SF Symbol)
+    s_bezelIconView = [[UIImageView alloc] initWithFrame:CGRectMake(10.0f, 9.0f, 16.0f, 16.0f)];
+    s_bezelIconView.contentMode = UIViewContentModeScaleAspectFit;
+    s_bezelIconView.tintColor = [UIColor whiteColor];
+    s_bezelIconView.image = [UIImage systemImageNamed:@"arrow.up.and.down"];
+    [s_bezelPillContainer addSubview:s_bezelIconView];
+
+    // Title label ("Scroll")
+    s_bezelTitleLabel = [[UILabel alloc] initWithFrame:CGRectMake(32.0f, 0.0f, pillWidth - 36.0f, pillHeight)];
+    s_bezelTitleLabel.text = @"Scroll";
+    s_bezelTitleLabel.textColor = [UIColor whiteColor];
+    s_bezelTitleLabel.font = [UIFont systemFontOfSize:12.5f weight:UIFontWeightSemibold];
+    s_bezelTitleLabel.textAlignment = NSTextAlignmentLeft;
+    [s_bezelPillContainer addSubview:s_bezelTitleLabel];
+
+    [s_bezelOverlayWindow addSubview:s_bezelPillContainer];
+}
+
+static void ShowCameraControlBezelOverlay(CGFloat delta, NSString *title, NSString *symbolName) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        EnsureBezelOverlayViewCreated();
+        if (!s_bezelPillContainer) return;
+
+        if (title && s_bezelTitleLabel) {
+            s_bezelTitleLabel.text = title;
+        }
+        if (symbolName && s_bezelIconView) {
+            UIImage *img = [UIImage systemImageNamed:symbolName];
+            if (img) s_bezelIconView.image = img;
+        }
+
+        if (s_bezelDismissTimer) {
+            [s_bezelDismissTimer invalidate];
+            s_bezelDismissTimer = nil;
+        }
+
+        if (!s_bezelPillVisible) {
+            s_bezelPillVisible = YES;
+            s_bezelPillContainer.transform = CGAffineTransformMakeTranslation(40.0f, 0.0f);
+            [UIView animateWithDuration:0.25
+                                  delay:0.0
+                 usingSpringWithDamping:0.75
+                  initialSpringVelocity:0.5
+                                options:UIViewAnimationOptionBeginFromCurrentState
+                             animations:^{
+                s_bezelPillContainer.alpha = 1.0f;
+                s_bezelPillContainer.transform = CGAffineTransformIdentity;
+            } completion:nil];
+        } else if (fabs(delta) > 0.01) {
+            CGFloat nudgeY = fmax(-3.0, fmin(3.0, (double)delta * 0.04));
+            [UIView animateWithDuration:0.08 animations:^{
+                s_bezelPillContainer.transform = CGAffineTransformMakeTranslation(0.0f, (CGFloat)nudgeY);
+            } completion:^(BOOL finished) {
+                [UIView animateWithDuration:0.08 animations:^{
+                    s_bezelPillContainer.transform = CGAffineTransformIdentity;
+                }];
+            }];
+        }
+
+        s_bezelDismissTimer = [NSTimer scheduledTimerWithTimeInterval:1.2
+                                                              repeats:NO
+                                                                block:^(NSTimer *timer) {
+            [UIView animateWithDuration:0.22 animations:^{
+                s_bezelPillContainer.alpha = 0.0f;
+                s_bezelPillContainer.transform = CGAffineTransformMakeTranslation(30.0f, 0.0f);
+            } completion:^(BOOL finished) {
+                s_bezelPillVisible = NO;
+            }];
+        }];
+    });
+}
+
 static char kCCScrollSliderAssociationKey;
 static char kCCControlsDelegateAssociationKey;
 
@@ -525,6 +654,7 @@ static void AddCameraControlScrollSlider(AVCaptureSession *session) {
             CC_LOG("AVCaptureSlider swipe: val=%.4f delta=%.4f scrollDelta=%.2f",
                    value, delta, (double)scrollDelta);
             HandleSwipeDeltaTriggered(scrollDelta);
+            ShowCameraControlBezelOverlay(scrollDelta, @"Scroll", @"arrow.up.and.down");
 
             // Infinite slider re-centering:
             // Programmatic setValue: does NOT trigger action callbacks in iOS 18 AVFoundation.
@@ -594,10 +724,12 @@ static void HandleLightPressTriggered(void) {
             // Compensate for the first press that already moved 1 step forward:
             // Move 2 steps backward so the net result is 1 step backward!
             PerformPageScroll(s_invertDirection.load() ? CCScrollDirectionNext : CCScrollDirectionPrevious, 2);
+            ShowCameraControlBezelOverlay(0.0f, @"Prev", @"arrow.up");
         } else {
             // Single light-press -> Page Down / Next Reel
             CC_LOG("Single Light-Press detected! Scrolling to next page/reel...");
             PerformPageScroll(s_invertDirection.load() ? CCScrollDirectionPrevious : CCScrollDirectionNext, 1);
+            ShowCameraControlBezelOverlay(0.0f, @"Next", @"arrow.down");
         }
     });
 }
@@ -613,6 +745,7 @@ static void HandleHardClickTriggered(void) {
         s_clickCount.fetch_add(1);
         CC_LOG("Hard Click detected! Scrolling to top of feed...");
         PerformScrollToTop();
+        ShowCameraControlBezelOverlay(0.0f, @"Top", @"arrow.up.to.line");
     });
 }
 
@@ -624,9 +757,11 @@ static void HandleSwipeDeltaTriggered(CGFloat deltaY) {
 
     if ([NSThread isMainThread]) {
         PerformContinuousDeltaScroll(effectiveDelta, NO);
+        ShowCameraControlBezelOverlay(effectiveDelta, @"Scroll", @"arrow.up.and.down");
     } else {
         dispatch_async(dispatch_get_main_queue(), ^{
             PerformContinuousDeltaScroll(effectiveDelta, NO);
+            ShowCameraControlBezelOverlay(effectiveDelta, @"Scroll", @"arrow.up.and.down");
         });
     }
 }
@@ -638,6 +773,7 @@ static void HandleDigitizerSwipeDeltaTriggered(CGFloat deltaY) {
     CGFloat effectiveDelta = s_invertDirection.load() ? -deltaY : deltaY;
     dispatch_async(dispatch_get_main_queue(), ^{
         PerformContinuousDeltaScroll(effectiveDelta, YES);
+        ShowCameraControlBezelOverlay(effectiveDelta, @"Scroll", @"arrow.up.and.down");
     });
 }
 
@@ -846,65 +982,33 @@ static void InstallHIDHook(void) {
 
 static void (*orig_AVCaptureSession_startRunning)(AVCaptureSession *session, SEL selector) = NULL;
 static void (*orig_AVCaptureSession_stopRunning)(AVCaptureSession *session, SEL selector) = NULL;
+static BOOL (*orig_AVCaptureSession_supportsControls)(AVCaptureSession *session, SEL selector) = NULL;
+static BOOL (*orig_AVCaptureSession_canAddControl)(AVCaptureSession *session, SEL selector, id control) = NULL;
 
 static __strong AVCaptureSession *s_persistedSession = nil;
 static __strong AVCaptureSession *s_feedSession = nil;
-static __strong UIView *s_feedPreviewView = nil;
-static __strong AVCaptureVideoPreviewLayer *s_feedPreviewLayer = nil;
-static __strong CALayer *s_feedCoverLayer = nil;
 static std::atomic<bool> s_isInBackground{false};
 static dispatch_queue_t s_feedSessionQueue = NULL;
 
 static void AttachCaptureEventInteractionToView(UIView *view);
 
-static void EnsurePreviewLayerAttached(AVCaptureSession *session) {
-    if (!session) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = GetActiveKeyWindow();
-        if (!window) return;
+static BOOL Hook_AVCaptureSession_supportsControls(AVCaptureSession *session, SEL selector) {
+    if (@available(iOS 18.0, *)) {
+        return YES;
+    }
+    return orig_AVCaptureSession_supportsControls ? orig_AVCaptureSession_supportsControls(session, selector) : NO;
+}
 
-        // Anchor s_feedPreviewView ONLY in the root window at index 0 (behind all app content).
-        // It must NEVER be inserted into topVC.view or presented modal view controllers (e.g. comments, sheets),
-        // which was causing the camera feed to display behind translucent modal presentations.
-        if (!s_feedPreviewView) {
-            s_feedPreviewView = [[UIView alloc] initWithFrame:window.bounds];
-            s_feedPreviewView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            s_feedPreviewView.userInteractionEnabled = NO;
-            s_feedPreviewView.backgroundColor = [UIColor blackColor];
-            s_feedPreviewView.accessibilityElementsHidden = YES;
-        }
-
-        if (!s_feedPreviewLayer) {
-            s_feedPreviewLayer = [AVCaptureVideoPreviewLayer layerWithSession:session];
-            s_feedPreviewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-            s_feedPreviewLayer.frame = window.bounds;
-            [s_feedPreviewView.layer addSublayer:s_feedPreviewLayer];
-        } else if (s_feedPreviewLayer.session != session) {
-            s_feedPreviewLayer.session = session;
-        }
-
-        // Add solid opaque black cover layer on top of preview layer so the live camera
-        // sensor video is 100% obscured from the user, while keeping the CoreAnimation render
-        // pipeline and AVFoundation hardware control connection active for iOS 18 SpringBoard.
-        if (!s_feedCoverLayer) {
-            s_feedCoverLayer = [CALayer layer];
-            s_feedCoverLayer.backgroundColor = [UIColor blackColor].CGColor;
-            s_feedCoverLayer.opacity = 1.0f;
-            s_feedCoverLayer.frame = window.bounds;
-            [s_feedPreviewView.layer addSublayer:s_feedCoverLayer];
-        }
-
-        s_feedPreviewView.frame = window.bounds;
-        s_feedPreviewLayer.frame = window.bounds;
-        s_feedCoverLayer.frame = window.bounds;
-
-        if (s_feedPreviewView.superview != window) {
-            [window insertSubview:s_feedPreviewView atIndex:0];
-        }
-
-        AttachCaptureEventInteractionToView(window);
-        CC_LOG("AVCaptureVideoPreviewLayer anchored cleanly in root window %p at index 0 with black cover", window);
-    });
+static BOOL Hook_AVCaptureSession_canAddControl(AVCaptureSession *session, SEL selector, id control) {
+    if (@available(iOS 18.0, *)) {
+        if (!control) return NO;
+        NSArray *existing = [session respondsToSelector:@selector(controls)] ? session.controls : nil;
+        if (existing && [existing containsObject:control]) return NO;
+        NSInteger maxCount = [session respondsToSelector:@selector(maxControlsCount)] ? session.maxControlsCount : 2;
+        if (existing && existing.count >= (NSUInteger)maxCount) return NO;
+        return YES;
+    }
+    return orig_AVCaptureSession_canAddControl ? orig_AVCaptureSession_canAddControl(session, selector, (AVCaptureControl *)control) : YES;
 }
 
 static void EnsureFeedCaptureSessionRunning(void) {
@@ -912,13 +1016,7 @@ static void EnsureFeedCaptureSessionRunning(void) {
     if (s_isInBackground.load()) return;
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
 
-    // Determine if Instagram's session is already persisted and running
-    if (s_persistedSession && s_persistedSession.isRunning) {
-        EnsurePreviewLayerAttached(s_persistedSession);
-        return;
-    }
     if (s_feedSession && s_feedSession.isRunning) {
-        EnsurePreviewLayerAttached(s_feedSession);
         return;
     }
 
@@ -929,111 +1027,51 @@ static void EnsureFeedCaptureSessionRunning(void) {
 
     dispatch_async(s_feedSessionQueue, ^{
         @try {
-            if (s_persistedSession && s_persistedSession.isRunning) {
-                EnsurePreviewLayerAttached(s_persistedSession);
-                return;
-            }
             if (s_feedSession && s_feedSession.isRunning) {
-                EnsurePreviewLayerAttached(s_feedSession);
                 return;
             }
 
             if (!s_feedSession) {
+                // Zero-Camera Dedicated Feed Session:
+                // Initialized WITHOUT any AVCaptureDeviceInput of type AVMediaTypeVideo.
+                // Because no video hardware device input is attached:
+                // 1. Physical camera sensor is NEVER powered on (zero camera battery consumption).
+                // 2. mediaserverd does NOT report video streaming to SystemStatusServer (GREEN DOT IS 100% OFF).
+                // 3. No AVCaptureVideoPreviewLayer exists (zero video bleed-through behind comments/modals).
                 s_feedSession = [[AVCaptureSession alloc] init];
-
-                // Battery Optimization 1: Ultra-Low Resolution Preset (352x288 instead of 1080p/4K)
-                // Slashes pixel processing load on ISP, memory bus, and GPU by ~95%
-                if ([s_feedSession canSetSessionPreset:AVCaptureSessionPresetLow]) {
-                    s_feedSession.sessionPreset = AVCaptureSessionPresetLow;
-                }
-
-                // 1. Add back camera device input
-                AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-                if (device) {
-                    // Battery Optimization 2: Sensor Throttling & Voice-Coil Motor Lock
-                    // Park focus and exposure motors to cut physical coil current to zero,
-                    // and drop sensor readout to the lowest supported hardware frame rate.
-                    NSError *lockError = nil;
-                    if ([device lockForConfiguration:&lockError]) {
-                        if ([device isFocusModeSupported:AVCaptureFocusModeLocked]) {
-                            device.focusMode = AVCaptureFocusModeLocked;
-                        }
-                        if ([device isExposureModeSupported:AVCaptureExposureModeLocked]) {
-                            device.exposureMode = AVCaptureExposureModeLocked;
-                        }
-                        if ([device isWhiteBalanceModeSupported:AVCaptureWhiteBalanceModeLocked]) {
-                            device.whiteBalanceMode = AVCaptureWhiteBalanceModeLocked;
-                        }
-                        if ([device respondsToSelector:@selector(isSmoothAutoFocusSupported)] && device.isSmoothAutoFocusSupported) {
-                            device.smoothAutoFocusEnabled = NO;
-                        }
-                        if ([device respondsToSelector:@selector(automaticallyAdjustsVideoHDREnabled)]) {
-                            device.automaticallyAdjustsVideoHDREnabled = NO;
-                        }
-
-                        // Configure lowest supported frame rate (e.g. 2-5 FPS instead of 30-60 FPS)
-                        AVCaptureDeviceFormat *format = device.activeFormat;
-                        if (format && format.videoSupportedFrameRateRanges.count > 0) {
-                            AVFrameRateRange *bestRange = nil;
-                            for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges) {
-                                if (!bestRange || range.minFrameRate < bestRange.minFrameRate) {
-                                    bestRange = range;
-                                }
-                            }
-                            if (bestRange && bestRange.maxFrameDuration.timescale > 0) {
-                                device.activeVideoMinFrameDuration = bestRange.maxFrameDuration;
-                                device.activeVideoMaxFrameDuration = bestRange.maxFrameDuration;
-                                CC_LOG("Configured low-power camera frame rate: %.1f FPS", (double)bestRange.minFrameRate);
-                            }
-                        }
-                        [device unlockForConfiguration];
-                    } else {
-                        CC_LOG("Could not lock camera for low-power configuration: %@", lockError);
-                    }
-
-                    NSError *error = nil;
-                    AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
-                    if (input && [s_feedSession canAddInput:input]) {
-                        [s_feedSession addInput:input];
-                    }
-                }
-
-                // 2. Add photo output to establish active capture pipeline connection
-                AVCapturePhotoOutput *photoOutput = [[AVCapturePhotoOutput alloc] init];
-                if ([photoOutput respondsToSelector:@selector(setHighResolutionCaptureEnabled:)]) {
-                    photoOutput.highResolutionCaptureEnabled = NO;
-                }
-                if ([s_feedSession canAddOutput:photoOutput]) {
-                    [s_feedSession addOutput:photoOutput];
-                }
             }
 
             if (!s_feedSession.isRunning) {
-                CC_LOG("Starting dedicated feed AVCaptureSession for Camera Control...");
+                CC_LOG("Starting zero-camera feed AVCaptureSession for Camera Control...");
                 if (orig_AVCaptureSession_startRunning) {
                     orig_AVCaptureSession_startRunning(s_feedSession, @selector(startRunning));
                 } else {
                     [s_feedSession startRunning];
                 }
-                CC_LOG("Dedicated feed AVCaptureSession running state: %d", s_feedSession.isRunning);
+                CC_LOG("Zero-camera feed AVCaptureSession running state: %d (Green Dot: OFF)", s_feedSession.isRunning);
             }
 
             if (@available(iOS 18.0, *)) {
                 AddCameraControlScrollSlider(s_feedSession);
             }
 
-            EnsurePreviewLayerAttached(s_feedSession);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIWindow *win = GetActiveKeyWindow();
+                if (win) {
+                    AttachCaptureEventInteractionToView(win);
+                }
+            });
         } @catch (NSException *e) {
-            CC_LOG("Exception starting dedicated feed session: %@", e);
+            CC_LOG("Exception starting dedicated zero-camera feed session: %@", e);
         }
     });
 }
 
 static void Hook_AVCaptureSession_startRunning(AVCaptureSession *session, SEL selector) {
-    // If our dedicated feed session is running and Instagram is starting its own camera session,
-    // stop our feed session so there is zero camera hardware conflict.
+    // If our dedicated zero-camera feed session is running and Instagram starts its own real camera session,
+    // yield our feed session so there is zero conflict.
     if (s_feedSession && s_feedSession != session && s_feedSession.isRunning) {
-        CC_LOG("Instagram camera session starting; yielding dedicated feed session %p", s_feedSession);
+        CC_LOG("Instagram camera session starting; yielding zero-camera feed session %p", s_feedSession);
         if (orig_AVCaptureSession_stopRunning) {
             orig_AVCaptureSession_stopRunning(s_feedSession, @selector(stopRunning));
         } else {
@@ -1049,26 +1087,24 @@ static void Hook_AVCaptureSession_startRunning(AVCaptureSession *session, SEL se
     if (@available(iOS 18.0, *)) {
         AddCameraControlScrollSlider(session);
     }
-
-    EnsurePreviewLayerAttached(session);
 }
 
 static void Hook_AVCaptureSession_stopRunning(AVCaptureSession *session, SEL selector) {
     CC_LOG("AVCaptureSession -stopRunning called: session=%p, appState=%ld, inBackground=%d",
            session, (long)[UIApplication sharedApplication].applicationState, s_isInBackground.load());
 
-    // When app is in background or transitioning to background, allow stopRunning so camera hardware powers down cleanly
-    if (s_isInBackground.load() || [UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
-        if (orig_AVCaptureSession_stopRunning) {
-            orig_AVCaptureSession_stopRunning(session, selector);
-        }
-        return;
+    // When Instagram stops its own camera session (or when going to background), allow it to stop
+    // so the real camera hardware powers down completely.
+    if (orig_AVCaptureSession_stopRunning) {
+        orig_AVCaptureSession_stopRunning(session, selector);
     }
 
-    // In foreground: Keep the session alive and retained so Camera Control remains active in the Feed section!
-    s_persistedSession = session;
-    EnsurePreviewLayerAttached(session);
-    CC_LOG("AVCaptureSession -stopRunning suppressed in foreground to maintain Camera Control in Feed: session=%p", session);
+    // In foreground: Resume our zero-camera feed session so Camera Control remains active in Feed without green dot!
+    if (!s_isInBackground.load() && [UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            EnsureFeedCaptureSessionRunning();
+        });
+    }
 }
 
 static void SetupAppLifecycleObservers(void) {
@@ -1080,6 +1116,14 @@ static void SetupAppLifecycleObservers(void) {
                 usingBlock:^(NSNotification *note) {
         CC_LOG("App entered background; stopping capture sessions to preserve battery");
         s_isInBackground.store(true);
+        if (s_bezelDismissTimer) {
+            [s_bezelDismissTimer invalidate];
+            s_bezelDismissTimer = nil;
+        }
+        if (s_bezelPillContainer) {
+            s_bezelPillContainer.alpha = 0.0f;
+            s_bezelPillVisible = NO;
+        }
         if (s_persistedSession && s_persistedSession.isRunning) {
             if (orig_AVCaptureSession_stopRunning) {
                 orig_AVCaptureSession_stopRunning(s_persistedSession, @selector(stopRunning));
@@ -1100,7 +1144,7 @@ static void SetupAppLifecycleObservers(void) {
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *note) {
-        CC_LOG("App became active; ensuring Camera Control session is active in Feed");
+        CC_LOG("App became active; ensuring zero-camera Camera Control session is active in Feed");
         s_isInBackground.store(false);
         EnsureFeedCaptureSessionRunning();
     }];
@@ -1137,6 +1181,30 @@ static void InstallCaptureSessionHook(void) {
             orig_AVCaptureSession_stopRunning = (void (*)(AVCaptureSession *, SEL))currentStop;
             method_setImplementation(stopMethod, (IMP)Hook_AVCaptureSession_stopRunning);
             CC_LOG("Hooked AVCaptureSession -stopRunning for Feed persistence");
+        }
+    }
+
+    // 3. Hook -[AVCaptureSession supportsControls] (iOS 18+)
+    SEL supportsSel = sel_registerName("supportsControls");
+    Method supportsMethod = class_getInstanceMethod(sessionClass, supportsSel);
+    if (supportsMethod) {
+        IMP currentSupports = method_getImplementation(supportsMethod);
+        if (currentSupports != (IMP)Hook_AVCaptureSession_supportsControls) {
+            orig_AVCaptureSession_supportsControls = (BOOL (*)(AVCaptureSession *, SEL))currentSupports;
+            method_setImplementation(supportsMethod, (IMP)Hook_AVCaptureSession_supportsControls);
+            CC_LOG("Hooked AVCaptureSession -supportsControls for zero-camera session compatibility");
+        }
+    }
+
+    // 4. Hook -[AVCaptureSession canAddControl:] (iOS 18+)
+    SEL canAddSel = sel_registerName("canAddControl:");
+    Method canAddMethod = class_getInstanceMethod(sessionClass, canAddSel);
+    if (canAddMethod) {
+        IMP currentCanAdd = method_getImplementation(canAddMethod);
+        if (currentCanAdd != (IMP)Hook_AVCaptureSession_canAddControl) {
+            orig_AVCaptureSession_canAddControl = (BOOL (*)(AVCaptureSession *, SEL, id))currentCanAdd;
+            method_setImplementation(canAddMethod, (IMP)Hook_AVCaptureSession_canAddControl);
+            CC_LOG("Hooked AVCaptureSession -canAddControl: for zero-camera session compatibility");
         }
     }
 }
@@ -1232,13 +1300,6 @@ static void Hook_UIViewController_viewDidAppear(UIViewController *self, SEL _cmd
 
     if (self.view && !self.view.hidden) {
         AttachCaptureEventInteractionToView(self.view);
-
-        AVCaptureSession *activeSession = (s_persistedSession && s_persistedSession.isRunning)
-            ? s_persistedSession
-            : s_feedSession;
-        if (activeSession && activeSession.isRunning) {
-            EnsurePreviewLayerAttached(activeSession);
-        }
     }
 }
 
