@@ -1484,6 +1484,8 @@ static void RegisterFeedSwipeDarwinNotificationObserver(void) {
 // Initialization & Constructor
 // ============================================================================
 
+
+
 void InstagramCameraControlScroll_Init(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
