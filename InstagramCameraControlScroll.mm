@@ -399,21 +399,22 @@ static void AddCameraControlScrollSlider(AVCaptureSession *session) {
     id slider = ((id (*)(id, SEL, NSString *, NSString *, float, float))objc_msgSend)(
         [sliderClass alloc],
         sel_registerName("initWithLocalizedTitle:symbolName:minValue:maxValue:"),
-        @"Scroll", @"arrow.up.and.down", -1.0f, 1.0f);
+        @"Scroll", @"arrow.up.and.down", 0.0f, 1.0f);
     if (!slider) return;
 
-    SEL setValueSel = sel_registerName("setValue:");
-    if ([slider respondsToSelector:setValueSel]) {
-        ((void (*)(id, SEL, float))objc_msgSend)(slider, setValueSel, 0.0f);
-    }
-
-    __block float previousValue = 0.0f;
-    __block BOOL isResettingValue = NO;
+    __block float previousValue = NAN;
+    __block NSTimeInterval lastSwipeTimestamp = 0.0;
     void (^action)(float) = ^(float value) {
-        if (isResettingValue) return;
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        if (std::isnan(previousValue) || (now - lastSwipeTimestamp > 0.35)) {
+            previousValue = value;
+            lastSwipeTimestamp = now;
+            return;
+        }
 
         float delta = value - previousValue;
         previousValue = value;
+        lastSwipeTimestamp = now;
         if (fabsf(delta) < 0.0005f) return;
 
         CGFloat viewportHeight = [UIScreen mainScreen].bounds.size.height;
@@ -421,14 +422,6 @@ static void AddCameraControlScrollSlider(AVCaptureSession *session) {
         CC_LOG("AVCaptureSlider swipe value=%.5f delta=%.5f scrollDelta=%.2f",
                value, delta, (double)scrollDelta);
         HandleSwipeDeltaTriggered(scrollDelta);
-
-        // Infinite bidirectional swipe: auto-recenter slider when approaching boundary
-        if (fabsf(value) > 0.6f && [slider respondsToSelector:setValueSel]) {
-            isResettingValue = YES;
-            previousValue = 0.0f;
-            ((void (*)(id, SEL, float))objc_msgSend)(slider, setValueSel, 0.0f);
-            isResettingValue = NO;
-        }
     };
     ((void (*)(id, SEL, dispatch_queue_t, id))objc_msgSend)(
         slider, sel_registerName("setActionQueue:action:"), dispatch_get_main_queue(), action);
@@ -732,17 +725,61 @@ static void (*orig_AVCaptureSession_stopRunning)(AVCaptureSession *session, SEL 
 
 static __strong AVCaptureSession *s_persistedSession = nil;
 static __strong AVCaptureSession *s_feedSession = nil;
+static __strong UIView *s_feedPreviewView = nil;
+static __strong AVCaptureVideoPreviewLayer *s_feedPreviewLayer = nil;
 static std::atomic<bool> s_isInBackground{false};
 static dispatch_queue_t s_feedSessionQueue = NULL;
+
+static void AttachCaptureEventInteractionToWindow(UIWindow *window);
+
+static void EnsurePreviewLayerAttached(AVCaptureSession *session) {
+    if (!session) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = GetActiveKeyWindow();
+        if (!window) return;
+
+        if (!s_feedPreviewView) {
+            s_feedPreviewView = [[UIView alloc] initWithFrame:window.bounds];
+            s_feedPreviewView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            s_feedPreviewView.userInteractionEnabled = NO;
+            s_feedPreviewView.alpha = 0.01f;
+            s_feedPreviewView.accessibilityElementsHidden = YES;
+        }
+
+        if (!s_feedPreviewLayer) {
+            s_feedPreviewLayer = [AVCaptureVideoPreviewLayer layerWithSession:session];
+            s_feedPreviewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+            s_feedPreviewLayer.frame = window.bounds;
+            [s_feedPreviewView.layer addSublayer:s_feedPreviewLayer];
+        } else if (s_feedPreviewLayer.session != session) {
+            s_feedPreviewLayer.session = session;
+        }
+
+        if (s_feedPreviewView.superview != window) {
+            [window insertSubview:s_feedPreviewView atIndex:0];
+        }
+        s_feedPreviewView.frame = window.bounds;
+        s_feedPreviewLayer.frame = window.bounds;
+
+        AttachCaptureEventInteractionToWindow(window);
+        CC_LOG("AVCaptureVideoPreviewLayer verified in window hierarchy for session %p", session);
+    });
+}
 
 static void EnsureFeedCaptureSessionRunning(void) {
     if (!s_enabled.load()) return;
     if (s_isInBackground.load()) return;
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
 
-    // If Instagram's session is already persisted and running, keep using it
-    if (s_persistedSession && s_persistedSession.isRunning) return;
-    if (s_feedSession && s_feedSession.isRunning) return;
+    // Determine if Instagram's session is already persisted and running
+    if (s_persistedSession && s_persistedSession.isRunning) {
+        EnsurePreviewLayerAttached(s_persistedSession);
+        return;
+    }
+    if (s_feedSession && s_feedSession.isRunning) {
+        EnsurePreviewLayerAttached(s_feedSession);
+        return;
+    }
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -751,15 +788,18 @@ static void EnsureFeedCaptureSessionRunning(void) {
 
     dispatch_async(s_feedSessionQueue, ^{
         @try {
-            if (s_persistedSession && s_persistedSession.isRunning) return;
-            if (s_feedSession && s_feedSession.isRunning) return;
+            if (s_persistedSession && s_persistedSession.isRunning) {
+                EnsurePreviewLayerAttached(s_persistedSession);
+                return;
+            }
+            if (s_feedSession && s_feedSession.isRunning) {
+                EnsurePreviewLayerAttached(s_feedSession);
+                return;
+            }
 
             if (!s_feedSession) {
                 s_feedSession = [[AVCaptureSession alloc] init];
-                if ([s_feedSession canSetSessionPreset:AVCaptureSessionPresetLow]) {
-                    s_feedSession.sessionPreset = AVCaptureSessionPresetLow;
-                }
-
+                // Retain standard High/Photo session preset required for iOS 18 Camera Control hardware
                 AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
                 if (device) {
                     NSError *error = nil;
@@ -783,6 +823,8 @@ static void EnsureFeedCaptureSessionRunning(void) {
                 }
                 CC_LOG("Dedicated feed AVCaptureSession running state: %d", s_feedSession.isRunning);
             }
+
+            EnsurePreviewLayerAttached(s_feedSession);
         } @catch (NSException *e) {
             CC_LOG("Exception starting dedicated feed session: %@", e);
         }
@@ -809,6 +851,8 @@ static void Hook_AVCaptureSession_startRunning(AVCaptureSession *session, SEL se
     if (@available(iOS 18.0, *)) {
         AddCameraControlScrollSlider(session);
     }
+
+    EnsurePreviewLayerAttached(session);
 }
 
 static void Hook_AVCaptureSession_stopRunning(AVCaptureSession *session, SEL selector) {
@@ -825,6 +869,7 @@ static void Hook_AVCaptureSession_stopRunning(AVCaptureSession *session, SEL sel
 
     // In foreground: Keep the session alive and retained so Camera Control remains active in the Feed section!
     s_persistedSession = session;
+    EnsurePreviewLayerAttached(session);
     CC_LOG("AVCaptureSession -stopRunning suppressed in foreground to maintain Camera Control in Feed: session=%p", session);
 }
 
