@@ -1,11 +1,12 @@
 # SpringBoard HID probe
 
-This temporary probe has two passive observers in SpringBoard:
+This SpringBoard component receives Camera Control input independently of Instagram's active capture session:
 
-- `IOHIDEventSystemClient` with the Monitor client type, which logs every callback event and its nested digitizer/vendor fields.
-- `UIApplication -_handleHIDEvent:`, which logs events reaching UIKit and calls the original handler unchanged.
+- `IOHIDEventSystemClient` uses the Monitor client type to observe system HID events.
+- Non-display digitizer deltas are relayed to Instagram through a Darwin notification. Instagram applies them through its existing scroll engine only while foregrounded and no Instagram capture-control slider session is running.
+- `UIApplication -_handleHIDEvent:` remains observational and forwards the original event unchanged.
 
-The private HID monitor is resolved dynamically. The log states whether its symbols were found and whether client creation succeeded; a failed or absent callback means this observation path is unavailable on that device/build. Neither observer consumes or dispatches events, and neither scrolls the feed. The trace does not identify Camera Control by itself; compare the event shape against ordinary touchscreen swipes and the working Instagram Camera swipe.
+The private HID monitor and Darwin notification functions are resolved dynamically. If monitor client creation or notification registration fails, the component logs that failure and the Feed receiver cannot work on that build. HID input is never consumed or dispatched. Non-display digitizer events are treated as Camera Control candidates; this hardware classification remains an inference because iOS does not expose a public Feed API for these swipes.
 
 ## Install
 
@@ -23,6 +24,6 @@ Clear or note the current log, then test the same Camera Control swipe in Instag
 log show --last 5m --style compact --predicate 'process == "SpringBoard" AND eventMessage CONTAINS "CameraControlSystemProbe"'
 ```
 
-The probe logs every callback event from the system monitor plus events reaching SpringBoard's UIKit handler, so ordinary input can produce substantial output. Use a short capture window.
+The component logs every callback event from the system monitor plus events reaching SpringBoard's UIKit handler, so ordinary input can produce substantial output. Use a short capture window.
 
-If the swipe appears in the system-monitor callback, its payload can guide the Feed receiver. If it appears only in UIKit, that gives a different candidate path. If it appears in neither, that only rules out these SpringBoard observers; it does not prove the event is absent from BackBoard or another system process.
+The existing `logs/` files are Instagram telemetry databases and do not record these SpringBoard events. Feed scrolling requires the monitor to receive non-display digitizer samples and the Instagram notification receiver to register successfully.

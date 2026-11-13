@@ -7,6 +7,7 @@
 #import <dlfcn.h>
 #import <stdint.h>
 #import <unistd.h>
+#import <math.h>
 
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef uint32_t IOHIDEventType;
@@ -40,12 +41,25 @@ static void (*s_originalHandleHIDEvent)(id, SEL, IOHIDEventRef);
 typedef void *(*IOHIDEventSystemClientCreateWithTypeFunc)(CFAllocatorRef, int, CFDictionaryRef);
 typedef void (*IOHIDEventSystemClientScheduleWithRunLoopFunc)(void *, CFRunLoopRef, CFStringRef);
 typedef void (*IOHIDEventSystemClientRegisterEventCallbackFunc)(void *, int32_t (*)(void *, void *, void *, IOHIDEventRef), void *, void *);
+typedef uint32_t (*ProbeNotifyRegisterCheckFunc)(const char *, int *);
+typedef uint32_t (*ProbeNotifySetStateFunc)(int, uint64_t);
+typedef uint32_t (*ProbeNotifyPostFunc)(const char *);
 static IOHIDEventSystemClientCreateWithTypeFunc s_createHIDClient;
 static IOHIDEventSystemClientScheduleWithRunLoopFunc s_scheduleHIDClient;
 static IOHIDEventSystemClientRegisterEventCallbackFunc s_registerHIDCallback;
 static void *s_hidClient;
+static ProbeNotifySetStateFunc s_notifySetState;
+static ProbeNotifyPostFunc s_notifyPost;
+static int s_notifyToken = -1;
+static uint32_t s_swipeSequence;
+static BOOL s_cameraControlTouchActive;
+static double s_lastCameraControlX;
+static double s_lastCameraControlY;
+static NSInteger s_cameraControlAxis;
 
 #define PROBE_LOG(fmt, ...) NSLog(@"[CameraControlSystemProbe] " fmt, ##__VA_ARGS__)
+
+static void ProcessSystemHIDTree(IOHIDEventRef event, NSUInteger depth);
 
 static double ProbeFloat(IOHIDEventRef event, IOHIDEventField field) {
     if (s_getFloat) return s_getFloat(event, field);
@@ -86,7 +100,67 @@ static int32_t ProbeSystemHIDEvent(void *target, void *context, void *sender, IO
     if (!event) return 0;
     PROBE_LOG("IOHIDEventSystemClient callback sender=%p event=%p", sender, event);
     LogHIDTree(event, 0);
+    ProcessSystemHIDTree(event, 0);
     return 0;
+}
+
+static void RelayFeedSwipeDelta(double deltaPoints) {
+    if (s_notifyToken < 0 || !s_notifySetState || !s_notifyPost || !isfinite(deltaPoints)) return;
+    int32_t centipoints = (int32_t)llround(fmax(-120.0, fmin(120.0, deltaPoints)) * 100.0);
+    if (!centipoints) return;
+    uint32_t sequence = ++s_swipeSequence;
+    if (!sequence) sequence = ++s_swipeSequence;
+    uint64_t state = ((uint64_t)sequence << 32) | (uint32_t)centipoints;
+    if (s_notifySetState(s_notifyToken, state) == 0) {
+        s_notifyPost("com.instagramscroll.cameracontrol.feed-swipe");
+    }
+}
+
+static void ProcessSystemHIDTree(IOHIDEventRef event, NSUInteger depth) {
+    if (!event || depth > 8 || !s_getType) return;
+    CFArrayRef children = s_getChildren ? s_getChildren(event) : NULL;
+    CFIndex count = children ? CFArrayGetCount(children) : 0;
+
+    if (s_getType(event) == kProbeHIDEventTypeDigitizer && count == 0 && s_getInteger) {
+        int32_t displayIntegrated = s_getInteger(event, kProbeDigitizerDisplayIntegrated);
+        int32_t touch = s_getInteger(event, kProbeDigitizerTouch);
+        if (displayIntegrated) {
+            s_cameraControlTouchActive = NO;
+            s_cameraControlAxis = 0;
+        } else if (!touch) {
+            s_cameraControlTouchActive = NO;
+            s_cameraControlAxis = 0;
+        } else {
+            double x = s_getFloat ? s_getFloat(event, kProbeDigitizerX)
+                                  : (double)s_getInteger(event, kProbeDigitizerX);
+            double y = s_getFloat ? s_getFloat(event, kProbeDigitizerY)
+                                  : (double)s_getInteger(event, kProbeDigitizerY);
+            if (isfinite(x) && isfinite(y)) {
+                if (!s_cameraControlTouchActive) {
+                    s_cameraControlTouchActive = YES;
+                    s_lastCameraControlX = x;
+                    s_lastCameraControlY = y;
+                    s_cameraControlAxis = 0;
+                } else {
+                    double dx = x - s_lastCameraControlX;
+                    double dy = y - s_lastCameraControlY;
+                    s_lastCameraControlX = x;
+                    s_lastCameraControlY = y;
+                    if (!s_cameraControlAxis && (fabs(dx) > 0.0001 || fabs(dy) > 0.0001))
+                        s_cameraControlAxis = fabs(dx) > fabs(dy) ? 1 : 2;
+                    double delta = s_cameraControlAxis == 1 ? dx : dy;
+                    if (s_cameraControlAxis && fabs(delta) > 0.00001) {
+                        double scale = fmax(fabs(x), fabs(y)) <= 1.5
+                            ? UIScreen.mainScreen.bounds.size.height : 15.0;
+                        RelayFeedSwipeDelta(delta * scale);
+                    }
+                }
+            }
+        }
+    }
+
+    for (CFIndex index = 0; index < count; ++index)
+        ProcessSystemHIDTree((IOHIDEventRef)CFArrayGetValueAtIndex(children, index), depth + 1);
 }
 
 static void InstallSystemHIDMonitor(void) {
@@ -100,6 +174,18 @@ static void InstallSystemHIDMonitor(void) {
     if (!s_createHIDClient || !s_scheduleHIDClient || !s_registerHIDCallback) {
         PROBE_LOG("System HID monitor unavailable: required private SPI symbol missing");
         return;
+    }
+
+    ProbeNotifyRegisterCheckFunc registerCheck =
+        (ProbeNotifyRegisterCheckFunc)dlsym(RTLD_DEFAULT, "notify_register_check");
+    s_notifySetState = (ProbeNotifySetStateFunc)dlsym(RTLD_DEFAULT, "notify_set_state");
+    s_notifyPost = (ProbeNotifyPostFunc)dlsym(RTLD_DEFAULT, "notify_post");
+    if (registerCheck && s_notifySetState && s_notifyPost) {
+        uint32_t status = registerCheck("com.instagramscroll.cameracontrol.feed-swipe", &s_notifyToken);
+        PROBE_LOG("Feed swipe relay token status=%u token=%d", status, s_notifyToken);
+        if (status != 0) s_notifyToken = -1;
+    } else {
+        PROBE_LOG("Feed swipe relay unavailable: Darwin notify symbols missing");
     }
 
     // Apple defines Monitor as the second client type (Admin is first).

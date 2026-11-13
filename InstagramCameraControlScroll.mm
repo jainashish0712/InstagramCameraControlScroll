@@ -120,6 +120,9 @@ static CGFloat s_lastCameraControlX = 0.0;
 static CGFloat s_lastCameraControlY = 0.0;
 static NSInteger s_cameraControlSwipeAxis = 0; // 0 = undecided, 1 = X, 2 = Y
 static std::atomic<bool> s_cameraControlPageFlipTriggered{false};
+static std::atomic<bool> s_captureControlSessionRunning{false};
+static int s_feedSwipeNotifyToken = -1;
+static uint32_t s_lastFeedSwipeSequence = 0;
 
 // ============================================================================
 // Haptic Feedback Generator
@@ -728,6 +731,7 @@ static void InstallHIDHook(void) {
 }
 
 static void (*orig_AVCaptureSession_startRunning)(AVCaptureSession *session, SEL selector) = NULL;
+static void (*orig_AVCaptureSession_stopRunning)(AVCaptureSession *session, SEL selector) = NULL;
 
 static void Hook_AVCaptureSession_startRunning(AVCaptureSession *session, SEL selector) {
     if (orig_AVCaptureSession_startRunning) {
@@ -735,7 +739,65 @@ static void Hook_AVCaptureSession_startRunning(AVCaptureSession *session, SEL se
     }
     if (@available(iOS 18.0, *)) {
         AddCameraControlScrollSlider(session);
+        if (objc_getAssociatedObject(session, &kCCScrollSliderAssociationKey)) {
+            s_captureControlSessionRunning.store(true);
+            CC_LOG("Camera Control slider session running; pausing Feed HID receiver");
+        }
     }
+}
+
+static void Hook_AVCaptureSession_stopRunning(AVCaptureSession *session, SEL selector) {
+    if (orig_AVCaptureSession_stopRunning) {
+        orig_AVCaptureSession_stopRunning(session, selector);
+    }
+    if (session && objc_getAssociatedObject(session, &kCCScrollSliderAssociationKey)) {
+        s_captureControlSessionRunning.store(false);
+        CC_LOG("Camera Control slider session stopped; enabling Feed HID receiver");
+    }
+}
+
+typedef uint32_t (*CCNotifyRegisterDispatchFunc)(const char *, int *, dispatch_queue_t, void (^)(int));
+typedef uint32_t (*CCNotifyGetStateFunc)(int, uint64_t *);
+
+static void InstallFeedSystemSwipeReceiver(void) {
+    CCNotifyRegisterDispatchFunc registerDispatch =
+        (CCNotifyRegisterDispatchFunc)dlsym(RTLD_DEFAULT, "notify_register_dispatch");
+    CCNotifyGetStateFunc getState =
+        (CCNotifyGetStateFunc)dlsym(RTLD_DEFAULT, "notify_get_state");
+    if (!registerDispatch || !getState) {
+        CC_LOG("Feed system swipe receiver unavailable: Darwin notify symbols missing");
+        return;
+    }
+
+    const char *name = "com.instagramscroll.cameracontrol.feed-swipe";
+    uint32_t status = registerDispatch(name, &s_feedSwipeNotifyToken,
+                                       dispatch_get_main_queue(), ^(int token) {
+        uint64_t state = 0;
+        if (getState(token, &state) != 0) return;
+
+        uint32_t sequence = (uint32_t)(state >> 32);
+        if (sequence == s_lastFeedSwipeSequence) return;
+        s_lastFeedSwipeSequence = sequence;
+        int32_t deltaCentipoints = (int32_t)(uint32_t)state;
+
+        UIApplication *app = [UIApplication sharedApplication];
+        if (app.applicationState != UIApplicationStateActive ||
+            s_captureControlSessionRunning.load()) {
+            return;
+        }
+
+        CGFloat delta = (CGFloat)deltaCentipoints / 100.0f;
+        if (fabs(delta) < 0.01f) return;
+        CC_LOG("SpringBoard Camera Control Feed swipe delta=%.2f", (double)delta);
+        HandleDigitizerSwipeDeltaTriggered(delta);
+    });
+
+    if (status != 0) {
+        CC_LOG("Feed system swipe receiver registration failed status=%u", status);
+        s_feedSwipeNotifyToken = -1;
+        return;
+    }
+    CC_LOG("Registered Darwin receiver for SpringBoard Camera Control swipes");
 }
 
 static void InstallCaptureSessionHook(void) {
@@ -757,6 +819,17 @@ static void InstallCaptureSessionHook(void) {
             orig_AVCaptureSession_startRunning = (void (*)(AVCaptureSession *, SEL))currentStart;
             method_setImplementation(startMethod, (IMP)Hook_AVCaptureSession_startRunning);
             CC_LOG("Hooked AVCaptureSession -startRunning for Camera Control slider setup");
+        }
+    }
+
+    SEL stopSel = @selector(stopRunning);
+    Method stopMethod = class_getInstanceMethod(sessionClass, stopSel);
+    if (stopMethod) {
+        IMP currentStop = method_getImplementation(stopMethod);
+        if (currentStop != (IMP)Hook_AVCaptureSession_stopRunning) {
+            orig_AVCaptureSession_stopRunning = (void (*)(AVCaptureSession *, SEL))currentStop;
+            method_setImplementation(stopMethod, (IMP)Hook_AVCaptureSession_stopRunning);
+            CC_LOG("Hooked AVCaptureSession -stopRunning to track Camera Control lifecycle");
         }
     }
 
@@ -937,6 +1010,10 @@ void InstagramCameraControlScroll_Init(void) {
         
         // 1. Install Low-Level HID Hook on UIApplication
         InstallHIDHook();
+
+        // In Feed, receive Camera Control digitizer deltas relayed by the
+        // SpringBoard probe. The active capture slider remains the Camera path.
+        InstallFeedSystemSwipeReceiver();
 
         // 2. Register a documented swipe-value control only on Instagram's own camera sessions.
         InstallCaptureSessionHook();
