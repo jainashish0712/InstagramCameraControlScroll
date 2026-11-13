@@ -848,6 +848,7 @@ static __strong AVCaptureSession *s_persistedSession = nil;
 static __strong AVCaptureSession *s_feedSession = nil;
 static __strong UIView *s_feedPreviewView = nil;
 static __strong AVCaptureVideoPreviewLayer *s_feedPreviewLayer = nil;
+static __strong CALayer *s_feedCoverLayer = nil;
 static std::atomic<bool> s_isInBackground{false};
 static dispatch_queue_t s_feedSessionQueue = NULL;
 
@@ -859,37 +860,47 @@ static void EnsurePreviewLayerAttached(AVCaptureSession *session) {
         UIWindow *window = GetActiveKeyWindow();
         if (!window) return;
 
-        UIViewController *topVC = GetTopViewController(window.rootViewController);
-        UIView *targetView = (topVC && topVC.view && !topVC.view.hidden) ? topVC.view : window;
-
+        // Anchor s_feedPreviewView ONLY in the root window at index 0 (behind all app content).
+        // It must NEVER be inserted into topVC.view or presented modal view controllers (e.g. comments, sheets),
+        // which was causing the camera feed to display behind translucent modal presentations.
         if (!s_feedPreviewView) {
             s_feedPreviewView = [[UIView alloc] initWithFrame:window.bounds];
             s_feedPreviewView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
             s_feedPreviewView.userInteractionEnabled = NO;
-            s_feedPreviewView.alpha = 1.0f; // Full opacity so CoreAnimation render tree treats it as active
+            s_feedPreviewView.backgroundColor = [UIColor blackColor];
             s_feedPreviewView.accessibilityElementsHidden = YES;
         }
 
         if (!s_feedPreviewLayer) {
             s_feedPreviewLayer = [AVCaptureVideoPreviewLayer layerWithSession:session];
             s_feedPreviewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-            s_feedPreviewLayer.frame = targetView.bounds;
+            s_feedPreviewLayer.frame = window.bounds;
             [s_feedPreviewView.layer addSublayer:s_feedPreviewLayer];
         } else if (s_feedPreviewLayer.session != session) {
             s_feedPreviewLayer.session = session;
         }
 
-        if (s_feedPreviewView.superview != targetView) {
-            [targetView insertSubview:s_feedPreviewView atIndex:0];
+        // Add solid opaque black cover layer on top of preview layer so the live camera
+        // sensor video is 100% obscured from the user, while keeping the CoreAnimation render
+        // pipeline and AVFoundation hardware control connection active for iOS 18 SpringBoard.
+        if (!s_feedCoverLayer) {
+            s_feedCoverLayer = [CALayer layer];
+            s_feedCoverLayer.backgroundColor = [UIColor blackColor].CGColor;
+            s_feedCoverLayer.opacity = 1.0f;
+            s_feedCoverLayer.frame = window.bounds;
+            [s_feedPreviewView.layer addSublayer:s_feedCoverLayer];
         }
-        s_feedPreviewView.frame = targetView.bounds;
-        s_feedPreviewLayer.frame = targetView.bounds;
 
-        AttachCaptureEventInteractionToView(targetView);
-        if (window != targetView) {
-            AttachCaptureEventInteractionToView(window);
+        s_feedPreviewView.frame = window.bounds;
+        s_feedPreviewLayer.frame = window.bounds;
+        s_feedCoverLayer.frame = window.bounds;
+
+        if (s_feedPreviewView.superview != window) {
+            [window insertSubview:s_feedPreviewView atIndex:0];
         }
-        CC_LOG("AVCaptureVideoPreviewLayer anchored in target view %p for session %p", targetView, session);
+
+        AttachCaptureEventInteractionToWindow(window);
+        CC_LOG("AVCaptureVideoPreviewLayer anchored cleanly in root window %p at index 0 with black cover", window);
     });
 }
 
