@@ -901,6 +901,8 @@ static void ProcessHIDEvent(IOHIDEventRef event, NSUInteger depth) {
                (unsigned long)depth, usagePage, usage, dataLength, hasChildren);
     }
 
+
+
     if (eventType == kIOHIDEventTypeDigitizer && !hasChildren) {
         ProcessCameraControlDigitizer(event);
     } else if (eventType == kIOHIDEventTypeScroll &&
@@ -1026,19 +1028,19 @@ static void AdjustSystemVolumeBy(float step) {
 }
 
 // ============================================================================
-// UIKit Scene Anchor: AVCaptureEventInteraction on UIWindow
-// Restores Camera Control routing without volume button hijacking
+// AVKit AVCaptureEventInteraction Setup (iOS 17.2+ / iOS 18+)
+// Active responder chain integration with volume passthrough
 // ============================================================================
 
-static void AttachCaptureEventInteractionToWindow(UIWindow *window) {
-    if (!window) return;
+static void AttachCaptureEventInteractionToView(UIView *view) {
+    if (!view) return;
 
     Class interactionClass = NSClassFromString(@"AVCaptureEventInteraction");
     if (!interactionClass) return;
 
-    for (id<UIInteraction> interaction in window.interactions) {
+    for (id<UIInteraction> interaction in view.interactions) {
         if ([interaction isKindOfClass:interactionClass]) {
-            return; // Already attached to this window
+            return; // Already attached to this view
         }
     }
 
@@ -1073,12 +1075,43 @@ static void AttachCaptureEventInteractionToWindow(UIWindow *window) {
                 interaction, primarySel, primaryHandler, secondaryHandler);
 
             if (interaction) {
-                [window addInteraction:interaction];
-                CC_LOG("Attached AVCaptureEventInteraction with volume passthrough to window: %p", window);
+                [view addInteraction:interaction];
+                CC_LOG("Attached AVCaptureEventInteraction with volume passthrough to view: %p", view);
             }
         }
     } @catch (NSException *e) {
         CC_LOG("Exception attaching AVCaptureEventInteraction: %@", e);
+    }
+}
+
+static void AttachCaptureEventInteractionToWindow(UIWindow *window) {
+    AttachCaptureEventInteractionToView(window);
+}
+
+// ============================================================================
+// UIViewController Swizzle: Active UI Responder Chain Registration
+// ============================================================================
+
+static void (*orig_UIViewController_viewDidAppear)(UIViewController *self, SEL _cmd, BOOL animated) = NULL;
+
+static void Hook_UIViewController_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
+    if (orig_UIViewController_viewDidAppear) {
+        orig_UIViewController_viewDidAppear(self, _cmd, animated);
+    }
+
+    if (self.view && !self.view.hidden) {
+        AttachCaptureEventInteractionToView(self.view);
+    }
+}
+
+static void InstallViewControllerHook(void) {
+    Class vcClass = [UIViewController class];
+    SEL sel = @selector(viewDidAppear:);
+    Method m = class_getInstanceMethod(vcClass, sel);
+    if (m) {
+        orig_UIViewController_viewDidAppear = (void (*)(UIViewController *, SEL, BOOL))method_getImplementation(m);
+        method_setImplementation(m, (IMP)Hook_UIViewController_viewDidAppear);
+        CC_LOG("Hooked -[UIViewController viewDidAppear:] for active responder chain integration");
     }
 }
 
@@ -1499,10 +1532,13 @@ void InstagramCameraControlScroll_Init(void) {
         // 2. Register a documented swipe-value control on active camera sessions and manage session persistence.
         InstallCaptureSessionHook();
 
-        // 3. Setup lifecycle observers for background/foreground session management
+        // 3. Hook viewDidAppear to integrate active UI responder chain with Camera Control
+        InstallViewControllerHook();
+
+        // 4. Setup lifecycle observers for background/foreground session management
         SetupAppLifecycleObservers();
 
-        // 4. Register Darwin notification listener for system HID monitor events
+        // 5. Register Darwin notification listener for system HID monitor events
         RegisterFeedSwipeDarwinNotificationObserver();
 
         // Spin up feed capture session and attach interaction immediately if already active
