@@ -12,6 +12,7 @@
 
 #import "InstagramCameraControlScroll.h"
 #import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -353,6 +354,100 @@ static BOOL PerformScrollToTop(void) {
 }
 
 // ============================================================================
+// Documented Camera Control swipe path: AVCaptureSlider on a running session
+// ============================================================================
+
+static void HandleSwipeDeltaTriggered(CGFloat deltaY);
+
+API_AVAILABLE(ios(18.0))
+@interface CCSessionControlsDelegate : NSObject <AVCaptureSessionControlsDelegate>
+@end
+
+@implementation CCSessionControlsDelegate
+- (void)sessionControlsDidBecomeActive:(AVCaptureSession *)session {
+    CC_LOG("AVCaptureSession Camera Control became active: %p", session);
+}
+- (void)sessionControlsWillEnterFullscreenAppearance:(AVCaptureSession *)session {
+    CC_LOG("AVCaptureSession Camera Control entering fullscreen appearance: %p", session);
+}
+- (void)sessionControlsWillExitFullscreenAppearance:(AVCaptureSession *)session {
+    CC_LOG("AVCaptureSession Camera Control leaving fullscreen appearance: %p", session);
+}
+- (void)sessionControlsDidBecomeInactive:(AVCaptureSession *)session {
+    CC_LOG("AVCaptureSession Camera Control became inactive: %p", session);
+}
+@end
+
+static char kCCScrollSliderAssociationKey;
+static char kCCControlsDelegateAssociationKey;
+
+static void AddCameraControlScrollSlider(AVCaptureSession *session) {
+    if (!session || ![session respondsToSelector:@selector(supportsControls)]) return;
+    if (objc_getAssociatedObject(session, &kCCScrollSliderAssociationKey)) return;
+
+    if (!session.supportsControls) {
+        CC_LOG("AVCaptureSession %p does not support Camera Control", session);
+        return;
+    }
+
+    Class sliderClass = NSClassFromString(@"AVCaptureSlider");
+    if (!sliderClass) {
+        CC_LOG("AVCaptureSlider unavailable for AVCaptureSession %p", session);
+        return;
+    }
+
+    id slider = ((id (*)(id, SEL, NSString *, NSString *, float, float))objc_msgSend)(
+        [sliderClass alloc],
+        sel_registerName("initWithLocalizedTitle:symbolName:minValue:maxValue:"),
+        @"Scroll", @"arrow.up.and.down", 0.0f, 1.0f);
+    if (!slider) return;
+
+    __block float previousValue = 0.0f;
+    void (^action)(float) = ^(float value) {
+        float delta = value - previousValue;
+        previousValue = value;
+        if (fabsf(delta) < 0.0005f) return;
+
+        CGFloat viewportHeight = [UIScreen mainScreen].bounds.size.height;
+        CGFloat scrollDelta = (CGFloat)delta * viewportHeight;
+        CC_LOG("AVCaptureSlider swipe value=%.5f delta=%.5f scrollDelta=%.2f",
+               value, delta, (double)scrollDelta);
+        HandleSwipeDeltaTriggered(scrollDelta);
+    };
+    ((void (*)(id, SEL, dispatch_queue_t, id))objc_msgSend)(
+        slider, sel_registerName("setActionQueue:action:"), dispatch_get_main_queue(), action);
+
+    SEL delegateSelector = sel_registerName("controlsDelegate");
+    id existingDelegate = [session respondsToSelector:delegateSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(session, delegateSelector)
+        : nil;
+    if (!existingDelegate) {
+        CCSessionControlsDelegate *delegate = [CCSessionControlsDelegate new];
+        SEL setDelegateSelector = sel_registerName("setControlsDelegate:queue:");
+        if (![session respondsToSelector:setDelegateSelector]) return;
+        ((void (*)(id, SEL, id, dispatch_queue_t))objc_msgSend)(
+            session, setDelegateSelector, delegate, dispatch_get_main_queue());
+        objc_setAssociatedObject(session, &kCCControlsDelegateAssociationKey,
+                                 delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        CC_LOG("Installed Camera Control delegate on running session %p", session);
+    }
+
+    // AVCaptureSession permits adding controls while running. Use the same
+    // configuration transaction as the app so the control is registered atomically.
+    [session beginConfiguration];
+    BOOL canAdd = [session canAddControl:(AVCaptureControl *)slider];
+    if (canAdd) {
+        [session addControl:(AVCaptureControl *)slider];
+        objc_setAssociatedObject(session, &kCCScrollSliderAssociationKey,
+                                 slider, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        CC_LOG("Added Camera Control Scroll slider to session %p", session);
+    } else {
+        CC_LOG("AVCaptureSession %p rejected Camera Control Scroll slider", session);
+    }
+    [session commitConfiguration];
+}
+
+// ============================================================================
 // Event Dispatches & Gesture Classifier
 // ============================================================================
 
@@ -432,9 +527,9 @@ static double ReadHIDFloatField(IOHIDEventRef event, IOHIDEventField field) {
 static void ProcessCameraControlDigitizer(IOHIDEventRef event) {
     if (!s_IOHIDEventGetIntegerValue && !s_IOHIDEventGetFloatValue) return;
 
-    // Ignore touchscreen digitizers. Camera Control is a separate, non-display
-    // touch surface; using this field also avoids turning ordinary screen drags
-    // into duplicate scroll input.
+    // Ignore display-integrated digitizers to avoid turning ordinary screen
+    // drags into duplicate scroll input. A non-display digitizer is still only
+    // a candidate source; it is not proof that this event came from Camera Control.
     int32_t displayIntegrated = s_IOHIDEventGetIntegerValue
         ? s_IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerIsDisplayIntegrated)
         : 0;
@@ -616,6 +711,36 @@ static void InstallHIDHook(void) {
     }
 }
 
+static void (*orig_AVCaptureSession_startRunning)(AVCaptureSession *session, SEL selector) = NULL;
+
+static void Hook_AVCaptureSession_startRunning(AVCaptureSession *session, SEL selector) {
+    if (orig_AVCaptureSession_startRunning) {
+        orig_AVCaptureSession_startRunning(session, selector);
+    }
+    if (@available(iOS 18.0, *)) {
+        AddCameraControlScrollSlider(session);
+    }
+}
+
+static void InstallCaptureSessionHook(void) {
+    // Loading the framework first makes the iOS 18 capture-control classes and
+    // AVCaptureSession implementation available before resolving the method.
+    dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
+    Class sessionClass = NSClassFromString(@"AVCaptureSession");
+    SEL selector = @selector(startRunning);
+    Method method = sessionClass ? class_getInstanceMethod(sessionClass, selector) : NULL;
+    if (!method) {
+        CC_LOG("Could not hook AVCaptureSession -startRunning: class or method unavailable");
+        return;
+    }
+
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)Hook_AVCaptureSession_startRunning) return;
+    orig_AVCaptureSession_startRunning = (void (*)(AVCaptureSession *, SEL))current;
+    method_setImplementation(method, (IMP)Hook_AVCaptureSession_startRunning);
+    CC_LOG("Hooked AVCaptureSession -startRunning for Camera Control slider setup");
+}
+
 // ============================================================================
 // AVKit AVCaptureEventInteraction Setup (iOS 17.2+ / iOS 18+)
 // ============================================================================
@@ -791,8 +916,11 @@ void InstagramCameraControlScroll_Init(void) {
         
         // 1. Install Low-Level HID Hook on UIApplication
         InstallHIDHook();
+
+        // 2. Register a documented swipe-value control on active camera sessions.
+        InstallCaptureSessionHook();
         
-        // 2. Observe Window Lifecycle to attach AVKit Interactions
+        // 3. Observe Window Lifecycle to attach AVKit Interactions
         [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeKeyNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
