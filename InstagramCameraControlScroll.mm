@@ -982,6 +982,106 @@ static __strong AVCaptureSession *s_feedSession = nil;
 static std::atomic<bool> s_isInBackground{false};
 static dispatch_queue_t s_feedSessionQueue = NULL;
 
+// ============================================================================
+// System Volume Passthrough for AVCaptureEventInteraction
+// ============================================================================
+
+static void AdjustSystemVolumeBy(float step) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        static __strong UISlider *s_volumeSlider = nil;
+        static __strong UIView *s_volumeView = nil;
+
+        if (!s_volumeSlider) {
+            if (!s_volumeView) {
+                dlopen("/System/Library/Frameworks/MediaPlayer.framework/MediaPlayer", RTLD_LAZY);
+                Class volumeViewClass = NSClassFromString(@"MPVolumeView");
+                if (volumeViewClass) {
+                    s_volumeView = [[volumeViewClass alloc] initWithFrame:CGRectMake(-1000.0f, -1000.0f, 1.0f, 1.0f)];
+                    s_volumeView.alpha = 0.0001f;
+                    s_volumeView.userInteractionEnabled = NO;
+                    UIWindow *win = GetActiveKeyWindow();
+                    if (win) {
+                        [win addSubview:s_volumeView];
+                    }
+                }
+            }
+            if (s_volumeView) {
+                for (UIView *subview in s_volumeView.subviews) {
+                    if ([subview isKindOfClass:[UISlider class]]) {
+                        s_volumeSlider = (UISlider *)subview;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (s_volumeSlider) {
+            float current = s_volumeSlider.value;
+            float newVol = fmaxf(0.0f, fminf(1.0f, current + step));
+            [s_volumeSlider setValue:newVol animated:YES];
+            [s_volumeSlider sendActionsForControlEvents:UIControlEventValueChanged];
+            CC_LOG("Volume passthrough: %.2f -> %.2f (step=%.4f)", current, newVol, step);
+        }
+    });
+}
+
+// ============================================================================
+// UIKit Scene Anchor: AVCaptureEventInteraction on UIWindow
+// Restores Camera Control routing without volume button hijacking
+// ============================================================================
+
+static void AttachCaptureEventInteractionToWindow(UIWindow *window) {
+    if (!window) return;
+
+    Class interactionClass = NSClassFromString(@"AVCaptureEventInteraction");
+    if (!interactionClass) return;
+
+    for (id<UIInteraction> interaction in window.interactions) {
+        if ([interaction isKindOfClass:interactionClass]) {
+            return; // Already attached to this window
+        }
+    }
+
+    @try {
+        SEL primarySel = sel_registerName("initWithPrimaryEventHandler:secondaryEventHandler:");
+        if ([interactionClass instancesRespondToSelector:primarySel]) {
+            id interaction = [interactionClass alloc];
+
+            // Primary Handler (Volume Down): Adjusts volume DOWN without scrolling feed
+            void (^primaryHandler)(id) = ^(id event) {
+                NSInteger phase = 0;
+                if ([event respondsToSelector:@selector(phase)]) {
+                    phase = ((NSInteger (*)(id, SEL))objc_msgSend)(event, @selector(phase));
+                }
+                if (phase == 0) { // AVCaptureEventPhaseBegan
+                    AdjustSystemVolumeBy(-0.0625f); // 1/16th volume step down
+                }
+            };
+
+            // Secondary Handler (Volume Up): Adjusts volume UP without scrolling feed
+            void (^secondaryHandler)(id) = ^(id event) {
+                NSInteger phase = 0;
+                if ([event respondsToSelector:@selector(phase)]) {
+                    phase = ((NSInteger (*)(id, SEL))objc_msgSend)(event, @selector(phase));
+                }
+                if (phase == 0) { // AVCaptureEventPhaseBegan
+                    AdjustSystemVolumeBy(0.0625f); // 1/16th volume step up
+                }
+            };
+
+            interaction = ((id (*)(id, SEL, id, id))objc_msgSend)(
+                interaction, primarySel, primaryHandler, secondaryHandler);
+
+            if (interaction) {
+                [window addInteraction:interaction];
+                CC_LOG("Attached AVCaptureEventInteraction with volume passthrough to window: %p", window);
+            }
+        }
+    } @catch (NSException *e) {
+        CC_LOG("Exception attaching AVCaptureEventInteraction: %@", e);
+    }
+}
+
 static BOOL Hook_AVCaptureSession_supportsControls(AVCaptureSession *session, SEL selector) {
     if (@available(iOS 18.0, *)) {
         return YES;
@@ -1088,6 +1188,13 @@ static void EnsureFeedCaptureSessionRunning(void) {
             if (@available(iOS 18.0, *)) {
                 AddCameraControlScrollSlider(s_feedSession);
             }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIWindow *keyWindow = GetActiveKeyWindow();
+                if (keyWindow) {
+                    AttachCaptureEventInteractionToWindow(keyWindow);
+                }
+            });
         } @catch (NSException *e) {
             CC_LOG("Exception starting port-muted spoofed feed session: %@", e);
         }
@@ -1173,7 +1280,20 @@ static void SetupAppLifecycleObservers(void) {
                 usingBlock:^(NSNotification *note) {
         CC_LOG("App became active; ensuring zero-camera Camera Control session is active in Feed");
         s_isInBackground.store(false);
+        UIWindow *win = GetActiveKeyWindow();
+        if (win) {
+            AttachCaptureEventInteractionToWindow(win);
+        }
         EnsureFeedCaptureSessionRunning();
+    }];
+
+    [nc addObserverForName:UIWindowDidBecomeKeyNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+        if ([note.object isKindOfClass:[UIWindow class]]) {
+            AttachCaptureEventInteractionToWindow((UIWindow *)note.object);
+        }
     }];
 }
 
@@ -1385,15 +1505,12 @@ void InstagramCameraControlScroll_Init(void) {
         // 4. Register Darwin notification listener for system HID monitor events
         RegisterFeedSwipeDarwinNotificationObserver();
 
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification *note) {
-            EnsureFeedCaptureSessionRunning();
-        }];
-
-        // Spin up feed capture session immediately if already active
+        // Spin up feed capture session and attach interaction immediately if already active
         dispatch_async(dispatch_get_main_queue(), ^{
+            UIWindow *win = GetActiveKeyWindow();
+            if (win) {
+                AttachCaptureEventInteractionToWindow(win);
+            }
             EnsureFeedCaptureSessionRunning();
         });
 
