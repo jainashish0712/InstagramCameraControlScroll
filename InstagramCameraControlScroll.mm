@@ -645,11 +645,9 @@ static void AddCameraControlScrollSlider(AVCaptureSession *session) {
 
             if (fabsf(delta) < 0.0005f) return;
 
-            // Swiping DOWN on Camera Control decreases value (delta < 0).
-            // To naturally scroll DOWN the feed (reveal lower posts),
-            // we invert the delta so negative delta becomes positive scroll offset.
+            // Direct non-inverted delta mapping
             CGFloat viewportHeight = [UIScreen mainScreen].bounds.size.height;
-            CGFloat scrollDelta = -(CGFloat)delta * (viewportHeight * 0.85f);
+            CGFloat scrollDelta = (CGFloat)delta * (viewportHeight * 0.85f);
 
             CC_LOG("AVCaptureSlider swipe: val=%.4f delta=%.4f scrollDelta=%.2f",
                    value, delta, (double)scrollDelta);
@@ -930,12 +928,6 @@ static void ProcessHIDEvent(IOHIDEventRef event, NSUInteger depth) {
                     CC_LOG("IOHIDEvent: Camera Control Shutter (Hard Click) detected!");
                     HandleHardClickTriggered();
                 }
-            } else if (usagePage == kHIDPage_Consumer) {
-                if (usage == kHIDUsage_Csmr_CameraAutofocus) {
-                    HandleLightPressTriggered();
-                } else if (usage == kHIDUsage_Csmr_CameraShutter) {
-                    HandleHardClickTriggered();
-                }
             }
         }
     }
@@ -989,8 +981,6 @@ static __strong AVCaptureSession *s_persistedSession = nil;
 static __strong AVCaptureSession *s_feedSession = nil;
 static std::atomic<bool> s_isInBackground{false};
 static dispatch_queue_t s_feedSessionQueue = NULL;
-
-static void AttachCaptureEventInteractionToView(UIView *view);
 
 static BOOL Hook_AVCaptureSession_supportsControls(AVCaptureSession *session, SEL selector) {
     if (@available(iOS 18.0, *)) {
@@ -1098,13 +1088,6 @@ static void EnsureFeedCaptureSessionRunning(void) {
             if (@available(iOS 18.0, *)) {
                 AddCameraControlScrollSlider(s_feedSession);
             }
-
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIWindow *win = GetActiveKeyWindow();
-                if (win) {
-                    AttachCaptureEventInteractionToView(win);
-                }
-            });
         } @catch (NSException *e) {
             CC_LOG("Exception starting port-muted spoofed feed session: %@", e);
         }
@@ -1254,111 +1237,6 @@ static void InstallCaptureSessionHook(void) {
 }
 
 // ============================================================================
-// AVKit AVCaptureEventInteraction Setup (iOS 17.2+ / iOS 18+)
-// ============================================================================
-
-static void AttachCaptureEventInteractionToView(UIView *view) {
-    if (!view) return;
-
-    Class interactionClass = NSClassFromString(@"AVCaptureEventInteraction");
-    if (!interactionClass) return;
-
-    // Check if interaction already attached
-    for (id<UIInteraction> interaction in view.interactions) {
-        if ([interaction isKindOfClass:interactionClass]) {
-            return;
-        }
-    }
-
-    @try {
-        SEL primarySel = sel_registerName("initWithPrimaryEventHandler:secondaryEventHandler:");
-        if ([interactionClass instancesRespondToSelector:primarySel]) {
-            id interaction = [interactionClass alloc];
-
-            void (^primaryHandler)(id) = ^(id event) {
-                NSInteger phase = 0;
-                if ([event respondsToSelector:@selector(phase)]) {
-                    phase = ((NSInteger (*)(id, SEL))objc_msgSend)(event, @selector(phase));
-                }
-                if (phase == 0) { // AVCaptureEventPhaseBegan
-                    HandleHardClickTriggered();
-                }
-            };
-
-            void (^secondaryHandler)(id) = ^(id event) {
-                NSInteger phase = 0;
-                if ([event respondsToSelector:@selector(phase)]) {
-                    phase = ((NSInteger (*)(id, SEL))objc_msgSend)(event, @selector(phase));
-                }
-                if (phase == 0) { // AVCaptureEventPhaseBegan
-                    HandleLightPressTriggered();
-                }
-            };
-
-            interaction = ((id (*)(id, SEL, id, id))objc_msgSend)(interaction, primarySel, primaryHandler, secondaryHandler);
-            if (interaction) {
-                [view addInteraction:interaction];
-                CC_LOG("Attached dual-handler AVCaptureEventInteraction to view: %p", view);
-                return;
-            }
-        }
-
-        // Single handler fallback
-        SEL singleSel = sel_registerName("initWithEventHandler:");
-        if ([interactionClass instancesRespondToSelector:singleSel]) {
-            id interaction = [interactionClass alloc];
-            void (^handler)(id) = ^(id event) {
-                NSInteger phase = 0;
-                if ([event respondsToSelector:@selector(phase)]) {
-                    phase = ((NSInteger (*)(id, SEL))objc_msgSend)(event, @selector(phase));
-                }
-                if (phase == 0) {
-                    HandleLightPressTriggered();
-                }
-            };
-            interaction = ((id (*)(id, SEL, id))objc_msgSend)(interaction, singleSel, handler);
-            if (interaction) {
-                [view addInteraction:interaction];
-                CC_LOG("Attached single-handler AVCaptureEventInteraction to view: %p", view);
-            }
-        }
-    } @catch (NSException *e) {
-        CC_LOG("Exception attaching AVCaptureEventInteraction: %@", e);
-    }
-}
-
-static void AttachCaptureEventInteractionToWindow(UIWindow *window) {
-    AttachCaptureEventInteractionToView(window);
-}
-
-// ============================================================================
-// UIViewController Swizzle: Active UI Responder Chain Registration
-// ============================================================================
-
-static void (*orig_UIViewController_viewDidAppear)(UIViewController *self, SEL _cmd, BOOL animated) = NULL;
-
-static void Hook_UIViewController_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
-    if (orig_UIViewController_viewDidAppear) {
-        orig_UIViewController_viewDidAppear(self, _cmd, animated);
-    }
-
-    if (self.view && !self.view.hidden) {
-        AttachCaptureEventInteractionToView(self.view);
-    }
-}
-
-static void InstallViewControllerHook(void) {
-    Class vcClass = [UIViewController class];
-    SEL sel = @selector(viewDidAppear:);
-    Method m = class_getInstanceMethod(vcClass, sel);
-    if (m) {
-        orig_UIViewController_viewDidAppear = (void (*)(UIViewController *, SEL, BOOL))method_getImplementation(m);
-        method_setImplementation(m, (IMP)Hook_UIViewController_viewDidAppear);
-        CC_LOG("Hooked -[UIViewController viewDidAppear:] for active responder chain integration");
-    }
-}
-
-// ============================================================================
 // Public C API Implementation
 // ============================================================================
 
@@ -1468,7 +1346,7 @@ static void RegisterFeedSwipeDarwinNotificationObserver(void) {
             CGFloat deltaPoints = (CGFloat)centipoints / 100.0f;
             if (std::isfinite((double)deltaPoints) && fabs(deltaPoints) > 0.01f) {
                 CGFloat viewportH = [UIScreen mainScreen].bounds.size.height;
-                CGFloat scrollDelta = -(CGFloat)deltaPoints * (viewportH * 0.05f);
+                CGFloat scrollDelta = (CGFloat)deltaPoints * (viewportH * 0.05f);
                 CC_LOG("Darwin relay feed swipe: centipoints=%d deltaPoints=%.2f scrollDelta=%.2f",
                        centipoints, (double)deltaPoints, (double)scrollDelta);
                 HandleSwipeDeltaTriggered(scrollDelta);
@@ -1501,42 +1379,21 @@ void InstagramCameraControlScroll_Init(void) {
         // 2. Register a documented swipe-value control on active camera sessions and manage session persistence.
         InstallCaptureSessionHook();
 
-        // 3. Hook viewDidAppear to integrate active UI responder chain with Camera Control
-        InstallViewControllerHook();
-
-        // 4. Setup lifecycle observers for background/foreground session management
+        // 3. Setup lifecycle observers for background/foreground session management
         SetupAppLifecycleObservers();
 
-        // 5. Register Darwin notification listener for system HID monitor events
+        // 4. Register Darwin notification listener for system HID monitor events
         RegisterFeedSwipeDarwinNotificationObserver();
-
-        // 6. Observe Window Lifecycle to attach AVKit Interactions
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeKeyNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification *note) {
-            UIWindow *win = (UIWindow *)note.object;
-            if (win && [win isKindOfClass:[UIWindow class]]) {
-                AttachCaptureEventInteractionToWindow(win);
-            }
-        }];
 
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
-            UIWindow *win = GetActiveKeyWindow();
-            if (win) {
-                AttachCaptureEventInteractionToWindow(win);
-            }
+            EnsureFeedCaptureSessionRunning();
         }];
 
-        // Attach immediately if key window is already present and spin up feed capture session
+        // Spin up feed capture session immediately if already active
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIWindow *win = GetActiveKeyWindow();
-            if (win) {
-                AttachCaptureEventInteractionToWindow(win);
-            }
             EnsureFeedCaptureSessionRunning();
         });
 
