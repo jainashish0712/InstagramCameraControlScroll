@@ -485,6 +485,7 @@ static __strong UIImageView *s_bezelIconView = nil;
 static __strong UILabel *s_bezelTitleLabel = nil;
 static __strong NSTimer *s_bezelDismissTimer = nil;
 static BOOL s_bezelPillVisible = NO;
+static const NSTimeInterval kCCBezelDismissTimeout = 10.0; // 10 seconds display timeout
 
 static void EnsureBezelOverlayViewCreated(void) {
     if (s_bezelOverlayWindow && s_bezelPillContainer) return;
@@ -591,7 +592,7 @@ static void ShowCameraControlBezelOverlay(CGFloat delta, NSString *title, NSStri
             }];
         }
 
-        s_bezelDismissTimer = [NSTimer scheduledTimerWithTimeInterval:1.2
+        s_bezelDismissTimer = [NSTimer scheduledTimerWithTimeInterval:kCCBezelDismissTimeout
                                                               repeats:NO
                                                                 block:^(NSTimer *timer) {
             [UIView animateWithDuration:0.22 animations:^{
