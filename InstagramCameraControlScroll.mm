@@ -341,7 +341,7 @@ static BOOL PerformPageScroll(CCScrollDirection direction, NSInteger steps = 1) 
     if (viewportH <= 0.0f) return NO;
     
     BOOL isPaging = sv.isPagingEnabled;
-    const char *className = class_getName(object_getClass(sv.delegate ?: sv));
+    const char *className = class_getName(object_getClass((id)sv.delegate ?: (id)sv));
     if (className && (strstr(className, "Clips") || strstr(className, "Reel"))) {
         isPaging = YES;
     }
@@ -394,7 +394,7 @@ static BOOL PerformContinuousDeltaScroll(CGFloat deltaY, BOOL isDigitizerSwipe) 
     if (viewportH <= 0.0f) return NO;
     
     BOOL isPaging = sv.isPagingEnabled;
-    const char *className = class_getName(object_getClass(sv.delegate ?: sv));
+    const char *className = class_getName(object_getClass((id)sv.delegate ?: (id)sv));
     if (className && (strstr(className, "Clips") || strstr(className, "Reel"))) {
         isPaging = YES;
     }
@@ -477,97 +477,99 @@ static char kCCScrollSliderAssociationKey;
 static char kCCControlsDelegateAssociationKey;
 
 static void AddCameraControlScrollSlider(AVCaptureSession *session) {
-    if (!session || ![session respondsToSelector:@selector(supportsControls)]) return;
-    if (objc_getAssociatedObject(session, &kCCScrollSliderAssociationKey)) return;
+    if (@available(iOS 18.0, *)) {
+        if (!session || ![session respondsToSelector:@selector(supportsControls)]) return;
+        if (objc_getAssociatedObject(session, &kCCScrollSliderAssociationKey)) return;
 
-    if (!session.supportsControls) {
-        CC_LOG("AVCaptureSession %p does not support Camera Control", session);
-        return;
-    }
-
-    Class sliderClass = NSClassFromString(@"AVCaptureSlider");
-    if (!sliderClass) {
-        CC_LOG("AVCaptureSlider unavailable for AVCaptureSession %p", session);
-        return;
-    }
-
-    id slider = ((id (*)(id, SEL, NSString *, NSString *, float, float))objc_msgSend)(
-        [sliderClass alloc],
-        sel_registerName("initWithLocalizedTitle:symbolName:minValue:maxValue:"),
-        @"Scroll", @"arrow.up.and.down", -100.0f, 100.0f);
-    if (!slider) return;
-
-    // Center slider value at 0.0f initially
-    if ([slider respondsToSelector:@selector(setValue:)]) {
-        ((void (*)(id, SEL, float))objc_msgSend)(slider, @selector(setValue:), 0.0f);
-    }
-
-    __block float previousValue = 0.0f;
-    __block BOOL isResetting = NO;
-
-    __weak id weakSlider = slider;
-    void (^action)(float) = ^(float value) {
-        if (isResetting) return;
-
-        float delta = value - previousValue;
-        previousValue = value;
-
-        if (fabsf(delta) < 0.0005f) return;
-
-        // Swiping DOWN on Camera Control decreases value (delta < 0).
-        // To naturally scroll DOWN the feed (reveal lower posts),
-        // we invert the delta so negative delta becomes positive scroll offset.
-        CGFloat viewportHeight = [UIScreen mainScreen].bounds.size.height;
-        CGFloat scrollDelta = -(CGFloat)delta * (viewportHeight * 0.85f);
-
-        CC_LOG("AVCaptureSlider swipe: val=%.4f delta=%.4f scrollDelta=%.2f",
-               value, delta, (double)scrollDelta);
-        HandleSwipeDeltaTriggered(scrollDelta);
-
-        // Infinite slider re-centering:
-        // Programmatic setValue: does NOT trigger action callbacks in iOS 18 AVFoundation.
-        // Re-centering when drifting away from 0 prevents hitting boundary clamps.
-        if (fabsf(value) > 15.0f) {
-            id strongSlider = weakSlider;
-            if (strongSlider && [strongSlider respondsToSelector:@selector(setValue:)]) {
-                isResetting = YES;
-                ((void (*)(id, SEL, float))objc_msgSend)(strongSlider, @selector(setValue:), 0.0f);
-                previousValue = 0.0f;
-                isResetting = NO;
-            }
+        if (!session.supportsControls) {
+            CC_LOG("AVCaptureSession %p does not support Camera Control", session);
+            return;
         }
-    };
-    ((void (*)(id, SEL, dispatch_queue_t, id))objc_msgSend)(
-        slider, sel_registerName("setActionQueue:action:"), dispatch_get_main_queue(), action);
 
-    SEL delegateSelector = sel_registerName("controlsDelegate");
-    id existingDelegate = [session respondsToSelector:delegateSelector]
-        ? ((id (*)(id, SEL))objc_msgSend)(session, delegateSelector)
-        : nil;
-    if (!existingDelegate) {
-        CCSessionControlsDelegate *delegate = [CCSessionControlsDelegate new];
-        SEL setDelegateSelector = sel_registerName("setControlsDelegate:queue:");
-        if (![session respondsToSelector:setDelegateSelector]) return;
-        ((void (*)(id, SEL, id, dispatch_queue_t))objc_msgSend)(
-            session, setDelegateSelector, delegate, dispatch_get_main_queue());
-        objc_setAssociatedObject(session, &kCCControlsDelegateAssociationKey,
-                                 delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        CC_LOG("Installed Camera Control delegate on running session %p", session);
-    }
+        Class sliderClass = NSClassFromString(@"AVCaptureSlider");
+        if (!sliderClass) {
+            CC_LOG("AVCaptureSlider unavailable for AVCaptureSession %p", session);
+            return;
+        }
 
-    // AVCaptureSession permits adding controls while running. Use the same
-    // configuration transaction as the app so the control is registered atomically.
-    [session beginConfiguration];
-    BOOL canAdd = [session canAddControl:(AVCaptureControl *)slider];
-    if (canAdd) {
-        [session addControl:(AVCaptureControl *)slider];
-        objc_setAssociatedObject(session, &kCCScrollSliderAssociationKey,
-                                 slider, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        CC_LOG("Added Camera Control Scroll slider to session %p", session);
-    } else {
-        CC_LOG("AVCaptureSession %p rejected Camera Control Scroll slider", session);
+        id slider = ((id (*)(id, SEL, NSString *, NSString *, float, float))objc_msgSend)(
+            [sliderClass alloc],
+            sel_registerName("initWithLocalizedTitle:symbolName:minValue:maxValue:"),
+            @"Scroll", @"arrow.up.and.down", -100.0f, 100.0f);
+        if (!slider) return;
+
+        // Center slider value at 0.0f initially
+        if ([slider respondsToSelector:@selector(setValue:)]) {
+            ((void (*)(id, SEL, float))objc_msgSend)(slider, @selector(setValue:), 0.0f);
+        }
+
+        __block float previousValue = 0.0f;
+        __block BOOL isResetting = NO;
+
+        __weak id weakSlider = slider;
+        void (^action)(float) = ^(float value) {
+            if (isResetting) return;
+
+            float delta = value - previousValue;
+            previousValue = value;
+
+            if (fabsf(delta) < 0.0005f) return;
+
+            // Swiping DOWN on Camera Control decreases value (delta < 0).
+            // To naturally scroll DOWN the feed (reveal lower posts),
+            // we invert the delta so negative delta becomes positive scroll offset.
+            CGFloat viewportHeight = [UIScreen mainScreen].bounds.size.height;
+            CGFloat scrollDelta = -(CGFloat)delta * (viewportHeight * 0.85f);
+
+            CC_LOG("AVCaptureSlider swipe: val=%.4f delta=%.4f scrollDelta=%.2f",
+                   value, delta, (double)scrollDelta);
+            HandleSwipeDeltaTriggered(scrollDelta);
+
+            // Infinite slider re-centering:
+            // Programmatic setValue: does NOT trigger action callbacks in iOS 18 AVFoundation.
+            // Re-centering when drifting away from 0 prevents hitting boundary clamps.
+            if (fabsf(value) > 15.0f) {
+                id strongSlider = weakSlider;
+                if (strongSlider && [strongSlider respondsToSelector:@selector(setValue:)]) {
+                    isResetting = YES;
+                    ((void (*)(id, SEL, float))objc_msgSend)(strongSlider, @selector(setValue:), 0.0f);
+                    previousValue = 0.0f;
+                    isResetting = NO;
+                }
+            }
+        };
+        ((void (*)(id, SEL, dispatch_queue_t, id))objc_msgSend)(
+            slider, sel_registerName("setActionQueue:action:"), dispatch_get_main_queue(), action);
+
+        SEL delegateSelector = sel_registerName("controlsDelegate");
+        id existingDelegate = [session respondsToSelector:delegateSelector]
+            ? ((id (*)(id, SEL))objc_msgSend)(session, delegateSelector)
+            : nil;
+        if (!existingDelegate) {
+            CCSessionControlsDelegate *delegate = [CCSessionControlsDelegate new];
+            SEL setDelegateSelector = sel_registerName("setControlsDelegate:queue:");
+            if (![session respondsToSelector:setDelegateSelector]) return;
+            ((void (*)(id, SEL, id, dispatch_queue_t))objc_msgSend)(
+                session, setDelegateSelector, delegate, dispatch_get_main_queue());
+            objc_setAssociatedObject(session, &kCCControlsDelegateAssociationKey,
+                                     delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            CC_LOG("Installed Camera Control delegate on running session %p", session);
+        }
+
+        // AVCaptureSession permits adding controls while running. Use the same
+        // configuration transaction as the app so the control is registered atomically.
+        [session beginConfiguration];
+        BOOL canAdd = [session canAddControl:(AVCaptureControl *)slider];
+        if (canAdd) {
+            [session addControl:(AVCaptureControl *)slider];
+            objc_setAssociatedObject(session, &kCCScrollSliderAssociationKey,
+                                     slider, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            CC_LOG("Added Camera Control Scroll slider to session %p", session);
+        } else {
+            CC_LOG("AVCaptureSession %p rejected Camera Control Scroll slider", session);
+        }
+        [session commitConfiguration];
     }
-    [session commitConfiguration];
 }
 
 // ============================================================================
@@ -713,8 +715,8 @@ static void ProcessCameraControlDigitizer(IOHIDEventRef event) {
 
     // HID digitizer positions may be normalized (0...1) or reported in device
     // units. Convert either representation into screen-like scroll distance.
-    CGFloat coordinateMagnitude = fmaxf(fmaxf(fabsf(x), fabsf(y)),
-                                        fmaxf(fabsf(s_lastCameraControlX), fabsf(s_lastCameraControlY)));
+    CGFloat coordinateMagnitude = fmax(fmax(fabs(x), fabs(y)),
+                                       fmax(fabs(s_lastCameraControlX), fabs(s_lastCameraControlY)));
     CGFloat scrollDelta = coordinateMagnitude <= 1.5f
         ? delta * [UIScreen mainScreen].bounds.size.height
         : delta * 15.0f;
@@ -899,7 +901,7 @@ static void EnsurePreviewLayerAttached(AVCaptureSession *session) {
             [window insertSubview:s_feedPreviewView atIndex:0];
         }
 
-        AttachCaptureEventInteractionToWindow(window);
+        AttachCaptureEventInteractionToView(window);
         CC_LOG("AVCaptureVideoPreviewLayer anchored cleanly in root window %p at index 0 with black cover", window);
     });
 }
