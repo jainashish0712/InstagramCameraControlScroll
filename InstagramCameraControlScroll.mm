@@ -80,7 +80,7 @@ static void ResolveIOHIDSymbolsOnce(void) {
         s_IOHIDEventGetIntegerValue = (IOHIDEventGetIntegerValueFunc)dlsym(RTLD_DEFAULT, "IOHIDEventGetIntegerValue");
         s_IOHIDEventGetFloatValue = (IOHIDEventGetFloatValueFunc)dlsym(RTLD_DEFAULT, "IOHIDEventGetFloatValue");
         s_IOHIDEventGetChildren = (IOHIDEventGetChildrenFunc)dlsym(RTLD_DEFAULT, "IOHIDEventGetChildren");
-        
+
         CC_LOG("Resolved IOHID symbols: GetType=%p, GetInt=%p, GetFloat=%p, GetChildren=%p",
                s_IOHIDEventGetType, s_IOHIDEventGetIntegerValue, s_IOHIDEventGetFloatValue, s_IOHIDEventGetChildren);
     });
@@ -140,7 +140,7 @@ static void PlayHapticFeedback(UIImpactFeedbackStyle style) {
 
 static UIWindow *GetActiveKeyWindow(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    
+
     // 1. Scene-based window lookup (iOS 13+)
     for (UIScene *scene in app.connectedScenes) {
         if (scene.activationState == UISceneActivationStateForegroundActive &&
@@ -156,7 +156,7 @@ static UIWindow *GetActiveKeyWindow(void) {
             }
         }
     }
-    
+
     // 2. Legacy keyWindow fallback
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -167,13 +167,13 @@ static UIWindow *GetActiveKeyWindow(void) {
         return app.windows.firstObject;
     }
 #pragma clang diagnostic pop
-    
+
     return nil;
 }
 
 static UIViewController *GetTopViewController(UIViewController *root) {
     if (!root) return nil;
-    
+
     if (root.presentedViewController && !root.presentedViewController.isBeingDismissed) {
         return GetTopViewController(root.presentedViewController);
     }
@@ -288,6 +288,7 @@ static UIScrollView *FindBestVerticalScrollView(void) {
         curr = curr.superview;
     }
 
+
     // 2. Comprehensive Search across window view hierarchy
     UIScrollView *bestCandidate = nil;
     CGFloat highestScore = -1.0f;
@@ -330,25 +331,25 @@ static BOOL PerformPageScroll(CCScrollDirection direction, NSInteger steps = 1) 
         CC_LOG("PerformPageScroll: No active visible UIScrollView found in hierarchy");
         return NO;
     }
-    
+
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (steps == 1 && (now - s_lastPageScrollTime < kMinPageInterval)) {
         return NO; // Debounce rapid consecutive triggers
     }
     s_lastPageScrollTime = now;
-    
+
     CGFloat viewportH = sv.bounds.size.height;
     if (viewportH <= 0.0f) return NO;
-    
+
     BOOL isPaging = sv.isPagingEnabled;
     const char *className = class_getName(object_getClass((id)sv.delegate ?: (id)sv));
     if (className && (strstr(className, "Clips") || strstr(className, "Reel"))) {
         isPaging = YES;
     }
-    
+
     CGPoint currentOffset = sv.contentOffset;
     CGFloat targetY = currentOffset.y;
-    
+
     if (isPaging) {
         // Discrete page snap (Reels / Stories)
         if (direction == CCScrollDirectionNext) {
@@ -365,13 +366,13 @@ static BOOL PerformPageScroll(CCScrollDirection direction, NSInteger steps = 1) 
             targetY = currentOffset.y - step;
         }
     }
-    
+
     // Clamp to valid content boundaries using adjustedContentInset
     UIEdgeInsets insets = [sv respondsToSelector:@selector(adjustedContentInset)] ? sv.adjustedContentInset : sv.contentInset;
     CGFloat minY = -insets.top;
     CGFloat maxY = fmaxf(minY, sv.contentSize.height - viewportH + insets.bottom);
     targetY = fmaxf(minY, fminf(targetY, maxY));
-    
+
     if (fabs(targetY - currentOffset.y) > 0.5f) {
         [sv setContentOffset:CGPointMake(currentOffset.x, targetY) animated:YES];
         PlayHapticFeedback(UIImpactFeedbackStyleMedium);
@@ -379,7 +380,7 @@ static BOOL PerformPageScroll(CCScrollDirection direction, NSInteger steps = 1) 
                (long)direction, (long)steps, isPaging, targetY);
         return YES;
     }
-    
+
     return NO;
 }
 
@@ -389,16 +390,16 @@ static BOOL PerformContinuousDeltaScroll(CGFloat deltaY, BOOL isDigitizerSwipe) 
         CC_LOG("PerformContinuousDeltaScroll: No active visible vertical UIScrollView found");
         return NO;
     }
-    
+
     CGFloat viewportH = sv.bounds.size.height;
     if (viewportH <= 0.0f) return NO;
-    
+
     BOOL isPaging = sv.isPagingEnabled;
     const char *className = class_getName(object_getClass((id)sv.delegate ?: (id)sv));
     if (className && (strstr(className, "Clips") || strstr(className, "Reel"))) {
         isPaging = YES;
     }
-    
+
     if (isPaging) {
         // In paging mode (Reels), accumulate swipe delta to trigger crisp page flips
         if (isDigitizerSwipe && s_cameraControlPageFlipTriggered.load()) return YES;
@@ -417,17 +418,17 @@ static BOOL PerformContinuousDeltaScroll(CGFloat deltaY, BOOL isDigitizerSwipe) 
         }
         return YES;
     }
-    
+
     // In continuous mode (Main Feed), apply smooth proportional offset
     CGPoint offset = sv.contentOffset;
     CGFloat scaledDelta = deltaY * s_sensitivity.load();
     CGFloat newY = offset.y + scaledDelta;
-    
+
     UIEdgeInsets insets = [sv respondsToSelector:@selector(adjustedContentInset)] ? sv.adjustedContentInset : sv.contentInset;
     CGFloat minY = -insets.top;
     CGFloat maxY = fmaxf(minY, sv.contentSize.height - viewportH + insets.bottom);
     newY = fmaxf(minY, fminf(newY, maxY));
-    
+
     if (fabs(newY - offset.y) > 0.1f) {
         [sv setContentOffset:CGPointMake(offset.x, newY) animated:NO];
         CC_LOG("Continuous scroll: sv=%p oldY=%.1f newY=%.1f maxY=%.1f delta=%.1f",
@@ -439,7 +440,7 @@ static BOOL PerformContinuousDeltaScroll(CGFloat deltaY, BOOL isDigitizerSwipe) 
 static BOOL PerformScrollToTop(void) {
     UIScrollView *sv = GetActiveScrollView();
     if (!sv) return NO;
-    
+
     UIEdgeInsets insets = [sv respondsToSelector:@selector(adjustedContentInset)] ? sv.adjustedContentInset : sv.contentInset;
     CGPoint topOffset = CGPointMake(sv.contentOffset.x, -insets.top);
     [sv setContentOffset:topOffset animated:YES];
@@ -578,14 +579,14 @@ static void AddCameraControlScrollSlider(AVCaptureSession *session) {
 
 static void HandleLightPressTriggered(void) {
     if (!s_enabled.load()) return;
-    
+
     dispatch_async(dispatch_get_main_queue(), ^{
         NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
         NSTimeInterval elapsedSinceLast = now - s_lastLightPressTime;
         s_lastLightPressTime = now;
-        
+
         s_lightPressCount.fetch_add(1);
-        
+
         // Detect double light-press -> Page Up / Previous Reel
         if (elapsedSinceLast > 0.05 && elapsedSinceLast < kDoublePressWindow) {
             CC_LOG("Double Light-Press detected! Scrolling to previous page/reel...");
@@ -603,12 +604,12 @@ static void HandleLightPressTriggered(void) {
 
 static void HandleHardClickTriggered(void) {
     if (!s_enabled.load()) return;
-    
+
     dispatch_async(dispatch_get_main_queue(), ^{
         NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
         if (now - s_lastClickTime < 0.35) return;
         s_lastClickTime = now;
-        
+
         s_clickCount.fetch_add(1);
         CC_LOG("Hard Click detected! Scrolling to top of feed...");
         PerformScrollToTop();
@@ -617,10 +618,10 @@ static void HandleHardClickTriggered(void) {
 
 static void HandleSwipeDeltaTriggered(CGFloat deltaY) {
     if (!s_enabled.load()) return;
-    
+
     s_swipeCount.fetch_add(1);
     CGFloat effectiveDelta = s_invertDirection.load() ? -deltaY : deltaY;
-    
+
     if ([NSThread isMainThread]) {
         PerformContinuousDeltaScroll(effectiveDelta, NO);
     } else {
@@ -830,7 +831,7 @@ static void Hook__handleHIDEvent(id self, SEL _cmd, IOHIDEventRef event) {
 
 static void InstallHIDHook(void) {
     ResolveIOHIDSymbolsOnce();
-    
+
     Class appClass = [UIApplication class];
     SEL sel = sel_registerName("_handleHIDEvent:");
     Method m = class_getInstanceMethod(appClass, sel);
@@ -939,7 +940,7 @@ static void EnsureFeedCaptureSessionRunning(void) {
 
             if (!s_feedSession) {
                 s_feedSession = [[AVCaptureSession alloc] init];
-                
+
                 // 1. Add back camera device input
                 AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
                 if (device) {
@@ -1096,22 +1097,22 @@ static void InstallCaptureSessionHook(void) {
 
 static void AttachCaptureEventInteractionToView(UIView *view) {
     if (!view) return;
-    
+
     Class interactionClass = NSClassFromString(@"AVCaptureEventInteraction");
     if (!interactionClass) return;
-    
+
     // Check if interaction already attached
     for (id<UIInteraction> interaction in view.interactions) {
         if ([interaction isKindOfClass:interactionClass]) {
             return;
         }
     }
-    
+
     @try {
         SEL primarySel = sel_registerName("initWithPrimaryEventHandler:secondaryEventHandler:");
         if ([interactionClass instancesRespondToSelector:primarySel]) {
             id interaction = [interactionClass alloc];
-            
+
             void (^primaryHandler)(id) = ^(id event) {
                 NSInteger phase = 0;
                 if ([event respondsToSelector:@selector(phase)]) {
@@ -1121,7 +1122,7 @@ static void AttachCaptureEventInteractionToView(UIView *view) {
                     HandleHardClickTriggered();
                 }
             };
-            
+
             void (^secondaryHandler)(id) = ^(id event) {
                 NSInteger phase = 0;
                 if ([event respondsToSelector:@selector(phase)]) {
@@ -1131,7 +1132,7 @@ static void AttachCaptureEventInteractionToView(UIView *view) {
                     HandleLightPressTriggered();
                 }
             };
-            
+
             interaction = ((id (*)(id, SEL, id, id))objc_msgSend)(interaction, primarySel, primaryHandler, secondaryHandler);
             if (interaction) {
                 [view addInteraction:interaction];
@@ -1139,7 +1140,7 @@ static void AttachCaptureEventInteractionToView(UIView *view) {
                 return;
             }
         }
-        
+
         // Single handler fallback
         SEL singleSel = sel_registerName("initWithEventHandler:");
         if ([interactionClass instancesRespondToSelector:singleSel]) {
@@ -1178,10 +1179,10 @@ static void Hook_UIViewController_viewDidAppear(UIViewController *self, SEL _cmd
     if (orig_UIViewController_viewDidAppear) {
         orig_UIViewController_viewDidAppear(self, _cmd, animated);
     }
-    
+
     if (self.view && !self.view.hidden) {
         AttachCaptureEventInteractionToView(self.view);
-        
+
         AVCaptureSession *activeSession = (s_persistedSession && s_persistedSession.isRunning)
             ? s_persistedSession
             : s_feedSession;
@@ -1300,7 +1301,7 @@ void InstagramCameraControlScroll_Init(void) {
         CC_LOG("Target Device: iPhone 16 Pro / iOS 18+");
         CC_LOG("Repurposing Camera Control: Swipe, Light-Press & Click");
         CC_LOG("=================================================");
-        
+
         // 1. Install Low-Level HID Hook on UIApplication
         InstallHIDHook();
 
@@ -1309,7 +1310,7 @@ void InstagramCameraControlScroll_Init(void) {
 
         // 3. Hook viewDidAppear to integrate active UI responder chain with Camera Control
         InstallViewControllerHook();
-        
+
         // 4. Setup lifecycle observers for background/foreground session management
         SetupAppLifecycleObservers();
 
@@ -1323,7 +1324,7 @@ void InstagramCameraControlScroll_Init(void) {
                 AttachCaptureEventInteractionToWindow(win);
             }
         }];
-        
+
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
@@ -1333,7 +1334,7 @@ void InstagramCameraControlScroll_Init(void) {
                 AttachCaptureEventInteractionToWindow(win);
             }
         }];
-        
+
         // Attach immediately if key window is already present and spin up feed capture session
         dispatch_async(dispatch_get_main_queue(), ^{
             UIWindow *win = GetActiveKeyWindow();
@@ -1342,7 +1343,7 @@ void InstagramCameraControlScroll_Init(void) {
             }
             EnsureFeedCaptureSessionRunning();
         });
-        
+
         CC_LOG("InstagramCameraControlScroll initialized successfully!");
     });
 }
