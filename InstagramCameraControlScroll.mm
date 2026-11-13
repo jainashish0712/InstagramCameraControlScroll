@@ -19,6 +19,7 @@
 #import <atomic>
 #import <cmath>
 
+
 #define CC_LOG(fmt, ...) NSLog(@"[InstagramCameraControlScroll] " fmt, ##__VA_ARGS__)
 
 // ============================================================================
